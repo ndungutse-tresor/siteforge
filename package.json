@@ -1,0 +1,24 @@
+{
+  "name": "siteforge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Finds Rwandan businesses with a missing or dead website, generates a preview site, and hosts it for them",
+  "main": "server.js",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "worker": "node src/jobs/worker.js",
+    "create-admin": "node scripts/create-admin.js",
+    "import": "node scripts/import.js",
+    "audit": "node scripts/audit.js",
+    "generate": "node scripts/generate.js",
+    "cron": "node scripts/cron.js",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.128.0"
+  }
+}
