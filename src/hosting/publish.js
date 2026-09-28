@@ -35,7 +35,7 @@ async function deploySite(siteId) {
     deployId = d.id;
     url = d.url;
   }
-  db.prepare('UPDATE generated_sites SET deploy_id = ? WHERE id = ?').run(deployId, site.id);
+  db.prepare("UPDATE generated_sites SET deploy_id = ?, published_at = datetime('now') WHERE id = ?").run(deployId, site.id);
   const client = db.prepare('SELECT * FROM clients WHERE prospect_id = ?').get(site.prospect_id);
   if (client && !client.domain) db.prepare('UPDATE clients SET live_url = ? WHERE id = ?').run(url, client.id);
   return { site_id: site.id, deploy_id: deployId, url, target: vercel.enabled() ? 'vercel' : 'local' };
@@ -60,4 +60,26 @@ async function restoreSite(client) {
   if (site) await deploySite(site.id);
 }
 
-module.exports = { approveSite, deploySite, suspendSite, restoreSite, liveSite };
+// out/ is not in git: after a move or a clean-up, rebuild a preview or published site from the
+// database the first time someone asks for it. Returns true when files were written.
+function restoreFiles(kind, slug) {
+  if (kind === 'previews') {
+    const s = db.prepare('SELECT * FROM generated_sites WHERE slug = ? ORDER BY version DESC LIMIT 1').get(slug);
+    if (!s) return false;
+    writeFiles('previews', slug, buildFiles({ prospectId: s.prospect_id, brief: JSON.parse(s.brief), content: JSON.parse(s.content), preview: true }));
+    return true;
+  }
+  // Only a version that was actually published comes back, and a suspended client stays suspended.
+  const s = db.prepare(`SELECT * FROM generated_sites WHERE slug = ? AND approved_by_admin IS NOT NULL AND published_at IS NOT NULL
+    ORDER BY published_at DESC, version DESC LIMIT 1`).get(slug);
+  if (!s) return false;
+  const client = db.prepare('SELECT * FROM clients WHERE prospect_id = ?').get(s.prospect_id);
+  if (client?.status === 'suspended') {
+    writeFiles('sites', slug, { 'index.html': renderSuspended({ business_name: client.business_name, brand: BRAND_NAME, contact: OPT_OUT_CONTACT }) });
+  } else {
+    writeFiles('sites', slug, cleanFiles(s));
+  }
+  return true;
+}
+
+module.exports = { approveSite, deploySite, suspendSite, restoreSite, liveSite, restoreFiles };

@@ -141,3 +141,20 @@ test('export and erase', () => {
   const client = db.prepare("SELECT prospect_id FROM clients LIMIT 1").get();
   assert.throws(() => eraseProspect(client.prospect_id), /client/);
 });
+
+test('missing preview and site files are rebuilt from the database', async () => {
+  const { restoreFiles } = require('../src/hosting/publish');
+  const { OUT } = require('../src/generation/build');
+  const row = db.prepare('SELECT * FROM generated_sites WHERE approved_by_admin IS NOT NULL ORDER BY id DESC LIMIT 1').get();
+  assert.ok(row, 'an approved site exists from the earlier test');
+  fs.rmSync(path.join(OUT, 'previews', row.slug), { recursive: true, force: true });
+  fs.rmSync(path.join(OUT, 'sites', row.slug), { recursive: true, force: true });
+  assert.equal(restoreFiles('previews', row.slug), true);
+  assert.ok(fs.existsSync(path.join(OUT, 'previews', row.slug, 'index.html')));
+  assert.equal(restoreFiles('sites', row.slug), true, 'it was published earlier, so it comes back');
+  assert.ok(fs.existsSync(path.join(OUT, 'sites', row.slug, 'robots.txt')));
+  assert.equal(restoreFiles('previews', 'no-such-site'), false);
+  db.prepare('UPDATE generated_sites SET published_at = NULL WHERE slug = ?').run(row.slug);
+  fs.rmSync(path.join(OUT, 'sites', row.slug), { recursive: true, force: true });
+  assert.equal(restoreFiles('sites', row.slug), false, 'a version that was never published is not put online');
+});

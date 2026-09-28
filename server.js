@@ -9,6 +9,7 @@ const { handle } = require('./src/api');
 const { sendJson } = require('./src/core/http');
 const { OUT } = require('./src/generation/build');
 const { startWorker } = require('./src/jobs/worker');
+const { restoreFiles } = require('./src/hosting/publish');
 
 const PUBLIC = path.join(__dirname, 'public');
 
@@ -22,7 +23,8 @@ const TYPES = {
   '.jpg': 'image/jpeg',
   '.jpeg': 'image/jpeg',
   '.webp': 'image/webp',
-  '.txt': 'text/plain; charset=utf-8'
+  '.txt': 'text/plain; charset=utf-8',
+  '.woff2': 'font/woff2'
 };
 
 const BASE_HEADERS = {
@@ -51,7 +53,7 @@ function sendFile(req, res, root, rel, csp) {
     res.writeHead(200, {
       'Content-Type': TYPES[ext] || 'application/octet-stream',
       'Content-Length': st.size,
-      'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=300',
+      'Cache-Control': ext === '.html' ? 'no-cache' : ext === '.woff2' ? 'public, max-age=31536000, immutable' : 'public, max-age=300',
       'Content-Security-Policy': csp
     });
     if (req.method === 'HEAD') return res.end();
@@ -85,11 +87,15 @@ const server = http.createServer(async (req, res) => {
     if (req.method !== 'GET' && req.method !== 'HEAD') return sendJson(res, 405, { error: 'method' });
     const p = decodeURIComponent(url.pathname);
 
-    if (p === '/') return redirect(res, '/admin/');
+    // Clients land on the portal; the admin panel stays at /admin/.
+    if (p === '/' || p === '/portal') return redirect(res, '/portal/');
     if (p === '/admin') return redirect(res, '/admin/');
-    if (p.startsWith('/admin/')) {
-      res.setHeader('X-Frame-Options', 'DENY');
-      return sendFile(req, res, PUBLIC, p === '/admin/' ? 'admin/index.html' : p.slice(1), ADMIN_CSP);
+    // /assets/ holds what both apps share: fonts, base styles, icons.
+    for (const app of ['admin', 'portal', 'assets']) {
+      if (p.startsWith(`/${app}/`)) {
+        res.setHeader('X-Frame-Options', 'DENY');
+        return sendFile(req, res, PUBLIC, p === `/${app}/` ? `${app}/index.html` : p.slice(1), ADMIN_CSP);
+      }
     }
 
     // /preview/<slug>/... = banner version; /sites/<slug>/... = published version (local hosting)
@@ -97,6 +103,9 @@ const server = http.createServer(async (req, res) => {
     if (m) {
       if (!m[3]) return redirect(res, `/${m[1]}/${m[2]}/`);
       const kind = m[1] === 'preview' ? 'previews' : 'sites';
+      if (!fs.existsSync(path.join(OUT, kind, m[2]))) {
+        try { restoreFiles(kind, m[2]); } catch (e) { console.error(`Could not rebuild ${kind}/${m[2]}: ${e.message}`); }
+      }
       const rel = m[3].endsWith('/') ? m[3] + 'index.html' : m[3];
       return sendFile(req, res, path.join(OUT, kind, m[2]), rel.slice(1), SITE_CSP);
     }

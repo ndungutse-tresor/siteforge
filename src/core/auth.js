@@ -3,7 +3,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { promisify } = require('node:util');
-const { DATA_DIR } = require('./db');
+const { db, DATA_DIR } = require('./db');
 
 const scrypt = promisify(crypto.scrypt);
 const KEYLEN = 32;
@@ -32,11 +32,15 @@ async function burnTime(secret) {
 }
 
 // ---------- signed session tokens ----------
+// Signs login cookies. On Vercel (read-only disk, many instances) it must come from SESSION_SECRET;
+// locally a random one is kept in data/secret.key.
 function loadSecret() {
   if (process.env.SESSION_SECRET) {
     if (process.env.SESSION_SECRET.length < 32) throw new Error('SESSION_SECRET must be at least 32 characters.');
     return Buffer.from(process.env.SESSION_SECRET);
   }
+  if (process.env.VERCEL) throw new Error('Set SESSION_SECRET (32+ random characters) in the Vercel project settings.');
+  fs.mkdirSync(DATA_DIR, { recursive: true });
   const file = path.join(DATA_DIR, 'secret.key');
   if (!fs.existsSync(file)) fs.writeFileSync(file, crypto.randomBytes(48).toString('base64'), { mode: 0o600 });
   return Buffer.from(fs.readFileSync(file, 'utf8').trim());
@@ -92,29 +96,26 @@ function cookie(name, value, { maxAgeSec, path: p = '/', secure }) {
 }
 
 // ---------- rate limiting ----------
+// Counted in the database, so every server instance (Vercel runs many) sees the same numbers.
 class Limiter {
-  constructor(max, windowMs) {
+  constructor(name, max, windowMs) {
+    this.name = name;
     this.max = max;
     this.windowMs = windowMs;
-    this.hits = new Map();
-    setInterval(() => {
-      const now = Date.now();
-      for (const [k, e] of this.hits) if (e.reset <= now) this.hits.delete(k);
-    }, 60000).unref();
   }
-  entry(key) {
-    const now = Date.now();
-    let e = this.hits.get(key);
-    if (!e || e.reset <= now) {
-      e = { n: 0, reset: now + this.windowMs };
-      this.hits.set(key, e);
-    }
-    return e;
+  key(k) { return `${this.name}:${String(k).slice(0, 200)}`; }
+  async blocked(k) {
+    const r = await db.get('SELECT hits FROM rate_limits WHERE key = ? AND reset_at > now()', this.key(k));
+    return Boolean(r && r.hits >= this.max);
   }
-  blocked(key) { return this.entry(key).n >= this.max; }
-  hit(key) { this.entry(key).n++; }
-  clear(key) { this.hits.delete(key); }
-  retryAfterSec(key) { return Math.ceil((this.entry(key).reset - Date.now()) / 1000); }
+  async hit(k) {
+    await db.run(`INSERT INTO rate_limits (key, hits, reset_at) VALUES (?, 1, now() + (?::int * interval '1 millisecond'))
+      ON CONFLICT (key) DO UPDATE SET
+        hits = CASE WHEN rate_limits.reset_at <= now() THEN 1 ELSE rate_limits.hits + 1 END,
+        reset_at = CASE WHEN rate_limits.reset_at <= now() THEN excluded.reset_at ELSE rate_limits.reset_at END`,
+    this.key(k), this.windowMs);
+  }
+  async clear(k) { await db.run('DELETE FROM rate_limits WHERE key = ?', this.key(k)); }
 }
 
 module.exports = { hashSecret, verifySecret, burnTime, signToken, verifyToken, parseCookies, cookie, Limiter };

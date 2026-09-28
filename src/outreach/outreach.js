@@ -72,4 +72,4 @@ function optOut(prospectId, note) {
   });
 }
 
-module.exports = { CHANNELS, composeMessage, whatsappLink, logOutreach, optOut, DoNotContactError };
+module.exports = { CHANNELS, composeMessage, whatsappLink, logOutreach, optOut, optOutLine, DoNotContactError };

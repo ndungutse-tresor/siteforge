@@ -23,6 +23,13 @@ module.exports = {
   BASE_URL: env('BASE_URL', `http://localhost:${env('PORT', '3100')}`).replace(/\/$/, ''),
   BRAND_NAME: env('BRAND_NAME', 'SiteForge'),
   OPT_OUT_CONTACT: env('OPT_OUT_CONTACT', 'reply STOP'),
+  // Client portal: the MoMo number clients pay to, and the share paid before work starts.
+  MOMO_PAY_NUMBER: env('MOMO_PAY_NUMBER'),
+  MOMO_PAY_NAME: env('MOMO_PAY_NAME'),
+  // MoMo Pay merchant code: clients dial *182*8*1*<code># (or scan the QR code) to pay.
+  MOMO_MERCHANT_CODE: env('MOMO_MERCHANT_CODE').replace(/\D/g, ''),
+  MOMO_MERCHANT_NAME: env('MOMO_MERCHANT_NAME'),
+  ADVANCE_PERCENT: Math.min(100, Math.max(1, Number(env('ADVANCE_PERCENT', '50')) || 50)),
   GOOGLE_PLACES_API_KEY: env('GOOGLE_PLACES_API_KEY'),
   ANTHROPIC_API_KEY: env('ANTHROPIC_API_KEY'),
   VERCEL_TOKEN: env('VERCEL_TOKEN'),

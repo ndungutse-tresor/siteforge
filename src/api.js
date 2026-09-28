@@ -23,19 +23,38 @@ const outreach = require('./outreach/outreach');
 const purge = require('./compliance/purge');
 const { exportProspect, eraseProspect } = require('./compliance/export');
 const { collectForProspect, getResearch } = require('./research/collect');
+const { problemReport } = require('./outreach/problems');
 const { classify, KIND_SQL } = require('./research/opportunity');
+const accounts = require('./portal/accounts');
+const portalServices = require('./portal/services');
+const orders = require('./portal/orders');
+const { BRAND_NAME, MOMO_PAY_NUMBER, MOMO_PAY_NAME, MOMO_MERCHANT_CODE, MOMO_MERCHANT_NAME, ADVANCE_PERCENT } = require('./core/config');
+const { merchantUssd, ussdTelUri, qrSvg } = require('./portal/qr');
 
 const ADMIN_COOKIE = 'sf_a';
 const ADMIN_HOURS = 12;
 const loginByIp = new Limiter(5, 15 * 60 * 1000);
+const CLIENT_COOKIE = 'sf_c';
+const CLIENT_DAYS = 14;
+const clientLoginByIp = new Limiter(20, 15 * 60 * 1000);
+const clientLoginById = new Limiter(5, 15 * 60 * 1000);
+const signupByIp = new Limiter(10, 60 * 60 * 1000);
 const SENT = Symbol('response already sent');
 
 // ---------- routing ----------
 const routes = [];
-function route(method, pattern, handler, { open = false } = {}) {
+// open: no login needed. client: a client-portal login is needed. Otherwise: an admin login.
+function route(method, pattern, handler, { open = false, client = false } = {}) {
   const keys = [];
   const re = new RegExp('^' + pattern.replace(/:(\w+)/g, (_, k) => { keys.push(k); return '([^/]+)'; }) + '$');
-  routes.push({ method, re, keys, handler, open });
+  routes.push({ method, re, keys, handler, open, client });
+}
+
+function requireClient(ctx) {
+  const p = verifyToken(ctx.cookies[CLIENT_COOKIE]);
+  const u = p && p.role === 'client' ? accounts.getUser(p.uid) : null;
+  if (!u || u.token_version !== p.v) throw new HttpError(401, 'login_required', 'Please log in.');
+  return u;
 }
 
 function requireAdmin(ctx) {
@@ -63,7 +82,8 @@ async function handle(req, res, url, { ip, secure }) {
       break;
     }
     if (!match) throw allowed ? new HttpError(405, 'method', 'Method not allowed.') : new HttpError(404, 'not_found', 'Not found.');
-    if (!match.open) ctx.admin = requireAdmin(ctx);
+    if (match.client) ctx.client = requireClient(ctx);
+    else if (!match.open) ctx.admin = requireAdmin(ctx);
     const out = await match.handler(ctx);
     if (out === SENT) return true;
     sendJson(res, 200, out === undefined ? { ok: true } : out, ctx.setCookies.length ? { 'Set-Cookie': ctx.setCookies } : undefined);
@@ -113,13 +133,18 @@ route('POST', '/api/logout', async (ctx) => {
   ctx.setCookies.push(cookie(ADMIN_COOKIE, '', { maxAgeSec: 0, path: '/api', secure: ctx.secure }));
 }, { open: true });
 
-route('GET', '/api/me', (ctx) => ({
+route('GET', '/api/me', (ctx) => {
+  try { ctx.admin = requireAdmin(ctx); } catch (e) { return { username: null }; }
+  return meFor(ctx);
+}, { open: true });
+
+const meFor = (ctx) => ({
   username: ctx.admin.username,
   features: { places: places.enabled(), ai: ai.enabled(), ai_model: ai.MODEL, vercel: vercel.enabled() },
   sectors: Object.fromEntries(Object.entries(SECTORS).map(([k, v]) => [k, v.label])),
   templates: Object.fromEntries(Object.entries(THEMES).map(([k, v]) => [k, v.label])),
   stages: STAGES
-}));
+});
 
 route('POST', '/api/password', async (ctx) => {
   const b = await readJson(ctx.req);
@@ -408,6 +433,8 @@ route('GET', '/api/prospects/:id/message', (ctx) => {
   return { ...msg, whatsapp };
 });
 
+route('GET', '/api/prospects/:id/problems', (ctx) => problemReport(prospectOr404(id(ctx)).id));
+
 route('POST', '/api/prospects/:id/outreach', async (ctx) => outreach.logOutreach(id(ctx), await readJson(ctx.req)));
 
 route('POST', '/api/prospects/:id/opt-out', async (ctx) => {
@@ -490,6 +517,166 @@ route('POST', '/api/prospects/:id/erase', async (ctx) => {
   const b = await readJson(ctx.req);
   if (b.confirm !== 'ERASE') throw new HttpError(400, 'confirm', 'Type ERASE to confirm.');
   return eraseProspect(id(ctx));
+});
+
+// ---------- client portal: accounts ----------
+// Clients have their own cookie (path /api/portal) and token role; an admin token never opens
+// these routes and a client token never opens admin routes.
+function setClientCookie(ctx, u) {
+  const token = signToken({ role: 'client', uid: u.id, v: u.token_version, exp: Date.now() + CLIENT_DAYS * 86400e3 });
+  ctx.setCookies.push(cookie(CLIENT_COOKIE, token, { maxAgeSec: CLIENT_DAYS * 86400, path: '/api/portal', secure: ctx.secure }));
+}
+
+// How clients pay: a MoMo Pay merchant code (dial or scan the QR) and/or a MoMo number to send to.
+const portalConfig = () => ({
+  brand: BRAND_NAME,
+  advance_percent: ADVANCE_PERCENT,
+  momo: MOMO_PAY_NUMBER || MOMO_MERCHANT_CODE ? {
+    number: MOMO_PAY_NUMBER || null,
+    name: MOMO_PAY_NAME || BRAND_NAME,
+    merchant: MOMO_MERCHANT_CODE ? {
+      code: MOMO_MERCHANT_CODE, name: MOMO_MERCHANT_NAME || MOMO_PAY_NAME || BRAND_NAME,
+      ussd: merchantUssd(MOMO_MERCHANT_CODE), tel: ussdTelUri(merchantUssd(MOMO_MERCHANT_CODE)), qr: '/api/portal/momo-qr.svg'
+    } : null
+  } : null
+});
+
+// Scanning it with a phone camera opens the dialer with the MoMo Pay code typed in.
+route('GET', '/api/portal/momo-qr.svg', (ctx) => {
+  if (!MOMO_MERCHANT_CODE) throw new HttpError(404, 'not_found', 'No merchant code set.');
+  ctx.res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
+  ctx.res.end(qrSvg(ussdTelUri(merchantUssd(MOMO_MERCHANT_CODE))));
+  return SENT;
+}, { open: true });
+
+route('GET', '/api/portal/services', () => ({ ...portalConfig(), services: portalServices.listActive() }), { open: true });
+
+route('POST', '/api/portal/signup', async (ctx) => {
+  const b = await readJson(ctx.req);
+  if (signupByIp.blocked(ctx.ip)) throw new HttpError(429, 'too_many', 'Too many new accounts from this connection. Try again later.');
+  signupByIp.hit(ctx.ip);
+  const u = await accounts.createAccount(b);
+  setClientCookie(ctx, u);
+  return { user: accounts.publicUser(u) };
+}, { open: true });
+
+route('POST', '/api/portal/login', async (ctx) => {
+  const b = await readJson(ctx.req);
+  const who = String(b.identifier || '').trim().toLowerCase();
+  if (clientLoginByIp.blocked(ctx.ip) || clientLoginById.blocked(who)) {
+    throw new HttpError(429, 'too_many', 'Too many attempts. Wait 15 minutes and try again.');
+  }
+  const u = await accounts.verifyLogin(b.identifier, b.password);
+  if (!u) {
+    clientLoginByIp.hit(ctx.ip);
+    clientLoginById.hit(who);
+    throw new HttpError(401, 'bad_login', 'Wrong phone number, email or password.');
+  }
+  clientLoginByIp.clear(ctx.ip);
+  clientLoginById.clear(who);
+  setClientCookie(ctx, u);
+  return { user: accounts.publicUser(u) };
+}, { open: true });
+
+route('POST', '/api/portal/logout', async (ctx) => {
+  await readJson(ctx.req);
+  ctx.setCookies.push(cookie(CLIENT_COOKIE, '', { maxAgeSec: 0, path: '/api/portal', secure: ctx.secure }));
+}, { open: true });
+
+route('GET', '/api/portal/me', (ctx) => {
+  try { ctx.client = requireClient(ctx); } catch (e) { return { user: null, ...portalConfig() }; }
+  return { user: accounts.publicUser(ctx.client), ...portalConfig() };
+}, { open: true });
+
+route('POST', '/api/portal/lang', async (ctx) => {
+  const b = await readJson(ctx.req);
+  return { user: accounts.publicUser(accounts.setLang(ctx.client.id, b.lang)) };
+}, { client: true });
+
+route('POST', '/api/portal/password', async (ctx) => {
+  const b = await readJson(ctx.req);
+  const u = await accounts.changePassword(ctx.client.id, b.current, b.next);
+  setClientCookie(ctx, u); // keep this device logged in; others are logged out
+}, { client: true });
+
+// ---------- client portal: orders ----------
+route('GET', '/api/portal/orders', (ctx) => ({ rows: orders.listForClient(ctx.client.id) }), { client: true });
+
+route('GET', '/api/portal/overview', (ctx) => orders.overviewForClient(ctx.client.id), { client: true });
+
+route('POST', '/api/portal/orders', async (ctx) => {
+  const o = orders.createOrder(ctx.client.id, await readJson(ctx.req));
+  return orders.getForClient(ctx.client.id, o.id);
+}, { client: true });
+
+route('GET', '/api/portal/orders/:id', (ctx) => orders.getForClient(ctx.client.id, id(ctx)), { client: true });
+
+route('POST', '/api/portal/orders/:id/payments', async (ctx) => {
+  orders.submitPayment(ctx.client.id, id(ctx), await readJson(ctx.req));
+  return orders.getForClient(ctx.client.id, id(ctx));
+}, { client: true });
+
+route('POST', '/api/portal/orders/:id/messages', async (ctx) => {
+  orders.clientMessage(ctx.client.id, id(ctx), await readJson(ctx.req));
+  return orders.getForClient(ctx.client.id, id(ctx));
+}, { client: true });
+
+route('POST', '/api/portal/orders/:id/cancel', async (ctx) => {
+  const b = await readJson(ctx.req);
+  orders.cancelOrder('client', id(ctx), { userId: ctx.client.id, reason: b.reason });
+  return orders.getForClient(ctx.client.id, id(ctx));
+}, { client: true });
+
+// ---------- client portal: admin side ----------
+route('GET', '/api/orders', (ctx) => {
+  const summary = orders.adminSummary();
+  if (ctx.url.searchParams.get('summary') === '1') return { summary }; // for the badge in the top bar
+  return { summary, rows: orders.listForAdmin({ status: ctx.url.searchParams.get('status') || '' }), momo_configured: Boolean(MOMO_PAY_NUMBER || MOMO_MERCHANT_CODE), payment: portalConfig().momo };
+});
+
+route('GET', '/api/orders/:id', (ctx) => orders.getForAdmin(id(ctx)));
+
+route('POST', '/api/orders/:id/updates', async (ctx) => {
+  orders.postUpdate(ctx.admin.username, id(ctx), await readJson(ctx.req));
+  return orders.getForAdmin(id(ctx));
+});
+
+route('POST', '/api/orders/:id/finish', async (ctx) => {
+  orders.markFinished(ctx.admin.username, id(ctx), await readJson(ctx.req));
+  return orders.getForAdmin(id(ctx));
+});
+
+route('POST', '/api/orders/:id/cancel', async (ctx) => {
+  const b = await readJson(ctx.req);
+  orders.cancelOrder('admin', id(ctx), { reason: b.reason });
+  return orders.getForAdmin(id(ctx));
+});
+
+route('POST', '/api/order-payments/:id/review', async (ctx) => {
+  const b = await readJson(ctx.req);
+  const o = orders.reviewPayment(ctx.admin.username, id(ctx), { approve: b.approve === true, note: b.note });
+  return orders.getForAdmin(o.id);
+});
+
+route('GET', '/api/services', () => ({ rows: portalServices.listAll(), advance_percent: ADVANCE_PERCENT }));
+
+route('POST', '/api/services', async (ctx) => portalServices.saveService(null, await readJson(ctx.req)));
+
+route('PATCH', '/api/services/:id', async (ctx) => portalServices.saveService(id(ctx), await readJson(ctx.req)));
+
+route('GET', '/api/accounts', () => ({ rows: accounts.listAccounts() }));
+
+route('POST', '/api/accounts/:id/reset-password', async (ctx) => {
+  await readJson(ctx.req);
+  return accounts.resetPassword(id(ctx));
+});
+
+route('GET', '/api/accounts/:id/export', (ctx) => accounts.exportAccount(id(ctx)));
+
+route('POST', '/api/accounts/:id/erase', async (ctx) => {
+  const b = await readJson(ctx.req);
+  if (b.confirm !== 'DELETE') throw new HttpError(400, 'confirm', 'Type DELETE to confirm.');
+  return accounts.eraseAccount(id(ctx));
 });
 
 module.exports = { handle };

@@ -21,7 +21,16 @@
   const $app = document.getElementById('app');
   const fmt = (n) => Number(n || 0).toLocaleString('en-US');
   const rwf = (n) => `RWF ${fmt(n)}`;
-  const when = (s) => (s ? String(s).replace('T', ' ').slice(0, 16) : '');
+  // The database stores UTC ("2026-09-28 10:51:35"). Show it in this computer's time (Kigali: UTC+2).
+  const when = (s) => {
+    if (!s) return '';
+    const str = String(s);
+    if (/^\d{4}-\d\d-\d\d$/.test(str)) return str; // a plain date, e.g. paid-until
+    const d = new Date(/[zZ]$|[+-]\d\d:?\d\d$/.test(str) ? str : str.replace(' ', 'T') + 'Z');
+    if (isNaN(d)) return str.replace('T', ' ').slice(0, 16);
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  };
 
   function toast(msg, err) {
     const t = h('div', { class: 'toast' + (err ? ' err' : ''), role: 'status' }, msg);
@@ -30,12 +39,17 @@
   }
 
   async function api(method, path, body) {
-    const res = await fetch(path, {
-      method,
-      headers: body !== undefined ? { 'Content-Type': 'application/json' } : {},
-      body: body !== undefined ? JSON.stringify(body) : undefined,
-      credentials: 'same-origin'
-    });
+    let res;
+    try {
+      res = await fetch(path, {
+        method,
+        headers: body !== undefined ? { 'Content-Type': 'application/json' } : {},
+        body: body !== undefined ? JSON.stringify(body) : undefined,
+        credentials: 'same-origin'
+      });
+    } catch (e) {
+      throw new Error('Cannot reach the SiteForge server. Check that it is running (npm start) and try again.');
+    }
     const json = await res.json().catch(() => ({}));
     if (res.status === 401 && path !== '/api/login') { state.me = null; render(); throw new Error('Please log in.'); }
     if (!res.ok) throw new Error(json.message || `Error ${res.status}`);
@@ -62,7 +76,11 @@
     view: 'pipeline',
     filters: { stage: '', sector: '', district: '', q: '', sort: 'score', hide_dnc: '1' },
     opp: { kind: 'new', sector: '', district: '', has_phone: '', collected: '' },
+    portalTab: 'orders',
+    orderFilter: '',
+    orderId: null,
     prospectId: null,
+    backTo: 'pipeline',
     tab: 'overview',
     lang: 'rw',
     frameMobile: false,
@@ -70,53 +88,106 @@
   };
 
   // ---------- shell ----------
+  // Which screen the address points at: #p12/site, #o3, #portal/services, #opportunities…
+  function fromHash() {
+    const hsh = location.hash;
+    const m = hsh.match(/^#p(\d+)(?:\/(\w+))?$/);
+    if (m) Object.assign(state, { view: 'prospect', prospectId: Number(m[1]), tab: m[2] || 'overview' });
+    else if (/^#(opportunities|clients|import|compliance)$/.test(hsh)) state.view = hsh.slice(1);
+    else if (/^#portal(\/(orders|services|accounts))?$/.test(hsh)) Object.assign(state, { view: 'portal', portalTab: hsh.split('/')[1] || 'orders' });
+    else if (/^#o\d+$/.test(hsh)) Object.assign(state, { view: 'order', orderId: Number(hsh.slice(2)) });
+    else state.view = 'pipeline';
+  }
+  const hashFor = () => (state.view === 'prospect' ? `#p${state.prospectId}/${state.tab}` : state.view === 'order' ? `#o${state.orderId}`
+    : state.view === 'portal' ? `#portal/${state.portalTab}` : state.view === 'pipeline' ? '' : `#${state.view}`);
+
   async function boot() {
-    try { state.me = await api('GET', '/api/me'); } catch (e) { state.me = null; }
-    const m = location.hash.match(/^#p(\d+)(?:\/(\w+))?$/);
-    if (m) { state.view = 'prospect'; state.prospectId = Number(m[1]); state.tab = m[2] || 'overview'; }
-    else if (/^#(opportunities|clients|import|compliance)$/.test(location.hash)) state.view = location.hash.slice(1);
+    const r = await api('GET', '/api/me').catch(() => null);
+    state.me = r && r.username ? r : null;
+    fromHash();
     render();
   }
 
   function go(view, extra = {}) {
+    // Opening a business remembers the list it was opened from, for the back button.
+    if (view === 'prospect' && state.view !== 'prospect') state.backTo = state.view;
     Object.assign(state, { view }, extra);
-    const hash = view === 'prospect' ? `#p${state.prospectId}/${state.tab}` : view === 'pipeline' ? '' : `#${view}`;
-    history.replaceState(null, '', location.pathname + hash);
+    const hash = hashFor();
+    // A new history entry, so the browser's Back and Forward buttons move between screens.
+    if (hash !== location.hash && !(hash === '' && location.hash === '')) {
+      history.pushState(null, '', location.pathname + location.search + hash);
+    }
     render();
     window.scrollTo(0, 0);
   }
+
+  // Back / Forward, or a link or typed address like #opportunities.
+  window.addEventListener('hashchange', () => {
+    if (!state.me) return;
+    const before = state.view;
+    fromHash();
+    if (state.view === 'prospect' && before !== 'prospect') state.backTo = before;
+    render();
+  });
+
+  // Page titles for views that don't draw their own header.
+  const PAGE_HEAD = {
+    pipeline: ['Pipeline', 'Every business we found. Score 0–100 shows how much they need a website: the higher, the better the prospect.'],
+    opportunities: ['Opportunities', 'Who needs a new website, whose site needs an update, and what we know about them.'],
+    import: ['Import', 'Bring businesses in from OpenStreetMap or your own list.'],
+    compliance: ['Compliance', 'Google terms, personal data and the do-not-contact list.']
+  };
 
   function render() {
     $app.replaceChildren();
     if (!state.me) return $app.append(loginView());
     const f = state.me.features;
-    const navItem = (key, label) => h('button', { 'aria-current': state.view === key || (key === 'pipeline' && state.view === 'prospect') ? 'page' : null, onclick: () => go(key) }, label);
-    $app.append(
-      h('header', { class: 'top' }, h('div', { class: 'inner' },
-        h('span', { class: 'logo' }, 'SiteForge'),
-        h('nav', { class: 'nav' }, navItem('pipeline', 'Pipeline'), navItem('opportunities', 'Opportunities'), navItem('clients', 'Clients'), navItem('import', 'Import'), navItem('compliance', 'Compliance')),
-        h('span', { class: 'spacer' }),
-        h('span', { class: 'feat' },
-          h('span', { class: 'badge ' + (f.places ? 'good' : ''), title: 'Google Places API' }, 'Places ' + (f.places ? 'on' : 'off')),
-          h('span', { class: 'badge ' + (f.ai ? 'good' : 'warn'), title: f.ai ? f.ai_model : 'No ANTHROPIC_API_KEY: placeholder copy' }, 'Claude ' + (f.ai ? 'on' : 'off')),
-          h('span', { class: 'badge ' + (f.vercel ? 'good' : ''), title: 'Vercel deploys' }, 'Vercel ' + (f.vercel ? 'on' : 'local'))),
-        h('span', { class: 'muted' }, state.me.username),
-        h('button', { class: 'btn', onclick: async () => { await api('POST', '/api/logout', {}); state.me = null; render(); } }, 'Log out'))),
-      h('main', { id: 'main' })
-    );
-    const main = document.getElementById('main');
-    ({ pipeline: pipelineView, opportunities: opportunitiesView, prospect: prospectView, clients: clientsView, import: importView, compliance: complianceView })[state.view](main);
+    const current = { prospect: 'pipeline', order: 'portal' }[state.view] || state.view;
+    const navItem = (key, ic, label, extra) => h('button', { 'aria-current': current === key ? 'page' : null, onclick: () => go(key) }, SF.icon(ic), label, extra);
+    const feature = (label, on, onText, offText, offClass = 'off', title) => h('div', { class: 'f', title },
+      label, h('span', { class: 'st ' + (on ? 'on' : offClass) }, on ? onText : offText));
+    const logout = h('button', { class: 'btn ghost', title: 'Log out', 'aria-label': 'Log out', onclick: async () => { await api('POST', '/api/logout', {}); state.me = null; render(); } }, SF.icon('logout'));
+    const main = h('main', { id: 'main' });
+    $app.append(h('div', { class: 'shell' },
+      h('aside', { class: 'side' },
+        h('a', { class: 'logo', href: '#', onclick: (e) => { e.preventDefault(); go('pipeline'); } }, SF.logoMark(), h('span', {}, 'SiteForge', h('small', {}, 'Admin'))),
+        h('nav', { class: 'nav', 'aria-label': 'Main' },
+          navItem('pipeline', 'chart', 'Pipeline'),
+          navItem('opportunities', 'target', 'Opportunities'),
+          navItem('portal', 'store', 'Client portal', h('span', { id: 'portal-badge', class: 'badge nav-count', hidden: true, title: 'Payments to check' })),
+          navItem('clients', 'briefcase', 'Hosting clients'),
+          navItem('import', 'upload', 'Import'),
+          navItem('compliance', 'shield', 'Compliance')),
+        h('div', { class: 'feat' }, h('span', { class: 't' }, 'Connections'),
+          feature('Claude', f.ai, 'on', 'off', 'warn', f.ai ? f.ai_model : 'No ANTHROPIC_API_KEY: sites get placeholder text'),
+          feature('Google Places', f.places, 'on', 'off', 'off', 'GOOGLE_PLACES_API_KEY'),
+          feature('Vercel', f.vercel, 'on', 'local', 'off', 'VERCEL_TOKEN')),
+        h('div', { class: 'whoami' }, h('span', { class: 'avatar' }, String(state.me.username).slice(0, 2).toUpperCase()),
+          h('div', {}, h('b', {}, state.me.username), h('span', {}, 'Administrator')), logout)),
+      main));
+    if (PAGE_HEAD[state.view]) {
+      const [title, sub] = PAGE_HEAD[state.view];
+      main.append(h('div', { class: 'page-head' }, h('div', { class: 't' }, h('h1', {}, title), h('p', {}, sub))));
+    }
+    // Shown until the screen's data has arrived.
+    const loading = h('div', { class: 'loading', role: 'status' }, h('span', { class: 'spinner', 'aria-hidden': 'true' }), 'Loading…');
+    main.append(loading);
+    const view = { pipeline: pipelineView, opportunities: opportunitiesView, prospect: prospectView, portal: portalView, order: orderView,
+      clients: clientsView, import: importView, compliance: complianceView }[state.view] || pipelineView;
+    Promise.resolve(view(main)).catch((e) => main.append(h('div', { class: 'card empty' }, e.message))).finally(() => loading.remove());
+    refreshPortalBadge();
   }
 
   function loginView() {
-    const user = h('input', { autocomplete: 'username', required: true });
-    const pass = h('input', { type: 'password', autocomplete: 'current-password', required: true });
-    const btn = h('button', { class: 'btn primary', type: 'submit' }, 'Log in');
+    const user = h('input', { id: 'admin-user', autocomplete: 'username', required: true });
+    const pass = h('input', { id: 'admin-pass', type: 'password', autocomplete: 'current-password', required: true });
+    const btn = h('button', { class: 'btn primary lg block', type: 'submit' }, 'Log in');
     return h('div', { class: 'login' }, h('form', { class: 'card', onsubmit: async (e) => {
       e.preventDefault();
       const ok = await act(btn, () => api('POST', '/api/login', { username: user.value, password: pass.value }));
       if (ok) boot();
-    } }, h('h1', {}, 'SiteForge admin'), h('label', { class: 'f' }, 'Username', user), h('label', { class: 'f' }, 'Password', pass), btn));
+    } }, h('span', { class: 'logo' }, SF.logoMark(), 'SiteForge'), h('h1', {}, 'Admin sign in'), h('p', {}, 'Prospecting, sites, clients and the client portal.'),
+      h('label', { class: 'f' }, 'Username', user), h('label', { class: 'f' }, 'Password', pass), btn));
   }
 
   // ---------- pipeline ----------
@@ -124,56 +195,91 @@
     if (s == null) return h('span', { class: 'score lo', title: 'Not audited' }, '–');
     return h('span', { class: 'score ' + (s >= 50 ? 'hi' : s >= 25 ? 'mid' : 'lo') }, s);
   }
-  const STATUS_CLASS = { live: 'good', none: 'bad', 'dns-dead': 'bad', 'taken-over': 'bad', parked: 'bad', unreachable: 'bad', timeout: 'bad', 'ssl-error': 'bad',
-    'invalid-url': 'bad', 'social-only': 'warn', blocked: '', 'robots-blocked': '' };
-  const statusBadge = (s) => (s ? h('span', { class: 'badge ' + (STATUS_CLASS[s] ?? (s.startsWith('http-') ? 'bad' : '')) }, s) : h('span', { class: 'muted' }, '–'));
-  const stageBadge = (s) => h('span', { class: 'badge ' + ({ won: 'good', interested: 'info', lost: 'bad', dormant: '' }[s] ?? 'info') }, s);
+  // Website status in plain words; the technical code stays in the tooltip.
+  const WEBSITE_STATUS = {
+    live: ['Works', 'good', 'The site loads (it may still have problems: see the score).'],
+    none: ['No website', 'bad', 'No website is known for this business.'],
+    'dns-dead': ['Domain expired', 'bad', 'The web address no longer works (DNS fails).'],
+    'taken-over': ['Taken over', 'bad', 'The old address now shows someone else\'s (spam) site.'],
+    parked: ['Parked page', 'bad', 'The domain shows a placeholder or "for sale" page.'],
+    unreachable: ['Not loading', 'bad', 'The site did not answer.'],
+    timeout: ['Not loading', 'bad', 'The site took too long to answer.'],
+    'ssl-error': ['Security warning', 'bad', 'Browsers show a certificate warning.'],
+    'invalid-url': ['Bad address', 'bad', 'The listed website is not a real web address.'],
+    'social-only': ['Social page only', 'warn', 'Only a Facebook / Instagram / link page.'],
+    blocked: ['Blocked our check', '', 'A firewall refused our automatic check. Look at it in a browser.'],
+    'robots-blocked': ['Blocked our check', '', 'robots.txt asks us not to read the site.']
+  };
+  const statusBadge = (s) => {
+    if (!s) return h('span', { class: 'badge plain', title: 'Not audited yet' }, 'Not checked');
+    const [label, cls, why] = WEBSITE_STATUS[s] || (s.startsWith('http-') ? [`Error ${s.slice(5)}`, 'bad', `The site answers with HTTP ${s.slice(5)}.`] : [s, '', '']);
+    return h('span', { class: 'badge ' + cls, title: `${why} (${s})` }, label);
+  };
+  const STAGE_LABEL = { discovered: 'Discovered', audited: 'Audited', generated: 'Site generated', contacted: 'Contacted', interested: 'Interested', won: 'Won', lost: 'Lost', dormant: 'Dormant' };
+  const stageLabel = (s) => STAGE_LABEL[s] || s;
+  const stageBadge = (s) => h('span', { class: 'badge ' + ({ won: 'good', interested: 'info', lost: 'bad', dormant: '' }[s] ?? 'info') }, stageLabel(s));
 
   async function pipelineView(main) {
     const f = state.filters;
-    const [stats, list] = await Promise.all([
-      api('GET', '/api/stats'),
-      api('GET', '/api/prospects?' + new URLSearchParams(Object.entries(f).filter(([, v]) => v)))
-    ]).catch((e) => { toast(e.message, true); return [null, null]; });
-    if (!stats) return;
-
-    const stat = (key, label, n) => h('button', { class: 'stat', 'aria-pressed': String(f.stage === key), onclick: () => { f.stage = key; render(); } }, h('b', {}, fmt(n)), h('span', {}, label));
-    main.append(h('div', { class: 'stats' },
-      stat('', 'All prospects', stats.total),
-      state.me.stages.map((s) => stat(s, s, stats.byStage[s]))));
-
+    const statsBox = h('div', { class: 'stats' });
+    const results = h('div');
+    let seq = 0;
     let t;
-    const search = h('input', { type: 'search', placeholder: 'Search name or notes', value: f.q, oninput: () => { clearTimeout(t); t = setTimeout(() => { f.q = search.value; render(); }, 350); } });
-    const sel = (key, opts, label) => h('select', { 'aria-label': label, onchange: (e) => { f[key] = e.target.value; render(); } },
+    const search = h('input', { type: 'search', placeholder: 'Search by name or notes', value: f.q, 'aria-label': 'Search',
+      oninput: () => { clearTimeout(t); t = setTimeout(() => { f.q = search.value; refresh(); }, 300); } });
+    const sel = (key, opts, label) => h('select', { 'aria-label': label, onchange: (e) => { f[key] = e.target.value; refresh(); } },
       opts.map(([v, l]) => h('option', { value: v, selected: f[key] === v }, l)));
-    const queueBtn = h('button', { class: 'btn', title: 'Queue audits for every prospect without a score' }, `Audit unscored (${fmt(stats.unaudited)})`);
-    queueBtn.onclick = () => act(queueBtn, () => api('POST', '/api/audit-queue', { limit: 500 }), (r) => `${r.queued} audits queued. They run 4 at a time in the background.`);
+    const districtSel = sel('district', [['', 'All districts']], 'District');
+    const queueBtn = h('button', { class: 'btn', title: 'Checks the website of every business that has no score yet, 4 at a time in the background' }, 'Audit unscored');
+    queueBtn.onclick = () => act(queueBtn, () => api('POST', '/api/audit-queue', { limit: 500 }), (r) => `${r.queued} audits started. They run 4 at a time in the background.`);
 
-    main.append(h('div', { class: 'row', style: 'margin-bottom:12px' },
+    // Page actions sit next to the title; the row below holds only filters.
+    main.querySelector('.page-head')?.append(h('div', { class: 'actions' }, queueBtn,
+      h('button', { class: 'btn primary', onclick: addProspectDialog }, SF.icon('plus', 'sm'), 'Add prospect')));
+    main.append(statsBox, h('div', { class: 'row filters' },
       search,
       sel('sector', [['', 'All sectors'], ...Object.entries(state.me.sectors)], 'Sector'),
-      sel('district', [['', 'All districts'], ...list.districts.map((d) => [d, d])], 'District'),
-      sel('sort', [['score', 'Best prospects first'], ['updated', 'Recently updated'], ['created', 'Newest'], ['name', 'Name']], 'Sort'),
-      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: f.hide_dnc === '1', onchange: (e) => { f.hide_dnc = e.target.checked ? '1' : ''; render(); } }), 'Hide do-not-contact'),
-      h('span', { class: 'spacer' }),
-      queueBtn,
-      h('button', { class: 'btn primary', onclick: addProspectDialog }, 'Add prospect')));
+      districtSel,
+      sel('sort', [['score', 'Best prospects first'], ['updated', 'Recently updated'], ['created', 'Newest'], ['name', 'Name A–Z']], 'Sort'),
+      h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: f.hide_dnc === '1', onchange: (e) => { f.hide_dnc = e.target.checked ? '1' : ''; refresh(); } }), 'Hide do-not-contact')), results);
 
-    if (!list.rows.length) {
-      main.append(h('div', { class: 'card empty' }, stats.total ? 'No prospects match these filters.' : 'No prospects yet. Use Import to pull businesses from OpenStreetMap or an RDB export, or add one by hand.'));
-      return;
+    // Only the counters and the table are redrawn; the search box and filters stay put.
+    async function refresh() {
+      const mine = ++seq;
+      results.classList.add('busy');
+      const [stats, list] = await Promise.all([
+        api('GET', '/api/stats'),
+        api('GET', '/api/prospects?' + new URLSearchParams(Object.entries(f).filter(([, v]) => v)))
+      ]).catch((e) => { toast(e.message, true); return [null, null]; });
+      if (mine !== seq) return; // a newer search has already started
+      results.classList.remove('busy');
+      if (!stats) return;
+
+      const stat = (key, label, n) => h('button', { class: 'stat', 'aria-pressed': String(f.stage === key), onclick: () => { f.stage = key; refresh(); } }, h('b', {}, fmt(n)), h('span', {}, label));
+      statsBox.replaceChildren(stat('', 'All prospects', stats.total), ...state.me.stages.map((s) => stat(s, stageLabel(s), stats.byStage[s])));
+      queueBtn.textContent = `Audit unscored (${fmt(stats.unaudited)})`;
+      queueBtn.disabled = !stats.unaudited;
+      if (districtSel.options.length === 1) {
+        districtSel.append(...list.districts.map((d) => h('option', { value: d, selected: f.district === d }, d)));
+      }
+
+      if (!list.rows.length) {
+        results.replaceChildren(h('div', { class: 'card empty' }, stats.total ? 'No businesses match these filters.' : 'No businesses yet. Use Import to bring them in from OpenStreetMap or a CSV list, or press "Add prospect".'));
+        return;
+      }
+      results.replaceChildren(h('div', { class: 'tablewrap' }, h('table', {},
+        h('thead', {}, h('tr', {}, [['Score', 'How much they need a website (0–100)'], ['Business'], ['Sector'], ['District'], ['Website'], ['Stage'], ['Updated']].map(([c, title]) => h('th', { title }, c)))),
+        h('tbody', {}, list.rows.map((p) => h('tr', { onclick: () => go('prospect', { prospectId: p.id, tab: 'overview' }) },
+          h('td', {}, scoreBadge(p.score)),
+          h('td', { class: 'name' }, p.name, p.do_not_contact ? [' ', h('span', { class: 'badge bad' }, 'do not contact')] : null),
+          h('td', {}, state.me.sectors[p.sector] || p.sector),
+          h('td', {}, p.district || ''),
+          h('td', {}, statusBadge(p.website_status)),
+          h('td', {}, stageBadge(p.stage)),
+          h('td', { class: 'muted small' }, when(p.updated_at))))))),
+        h('p', { class: 'muted small' }, `Showing ${fmt(list.rows.length)} of ${fmt(list.total)}${list.total > list.rows.length ? ' (the best 200; use the filters or search to find others)' : ''}.`));
     }
-    main.append(h('div', { class: 'tablewrap' }, h('table', {},
-      h('thead', {}, h('tr', {}, ['Score', 'Business', 'Sector', 'District', 'Website', 'Stage', 'Updated'].map((c) => h('th', {}, c)))),
-      h('tbody', {}, list.rows.map((p) => h('tr', { onclick: () => go('prospect', { prospectId: p.id, tab: 'overview' }) },
-        h('td', {}, scoreBadge(p.score)),
-        h('td', { class: 'name' }, p.name, p.do_not_contact ? [' ', h('span', { class: 'badge bad' }, 'do not contact')] : null),
-        h('td', {}, state.me.sectors[p.sector] || p.sector),
-        h('td', {}, p.district || ''),
-        h('td', {}, statusBadge(p.website_status)),
-        h('td', {}, stageBadge(p.stage)),
-        h('td', { class: 'muted small' }, when(p.updated_at))))))));
-    main.append(h('p', { class: 'muted small' }, `Showing ${list.rows.length} of ${fmt(list.total)}.`));
+    await refresh();
   }
 
   // ---------- opportunities: who needs a new site, whose site needs updating ----------
@@ -199,6 +305,7 @@
     const n = Math.min(r.total, 500);
     const collectBtn = h('button', { class: 'btn primary', title: 'Reads each business\'s OpenStreetMap entry and its own website (respecting robots.txt), 2 at a time' },
       f.collected === '1' ? `Collect again (${fmt(n)})` : `Collect info for these (${fmt(n)})`);
+    collectBtn.disabled = !n;
     collectBtn.onclick = () => act(collectBtn, () => api('POST', '/api/research-queue', { ...f, limit: 500 }),
       (x) => `${x.queued} queued. Runs in the background; refresh this page to see progress.`);
     const csv = h('a', { class: 'btn', href: '/api/opportunities.csv?' + qs, download: '' }, 'Download CSV');
@@ -218,7 +325,7 @@
     }
     main.append(h('div', { class: 'tablewrap' }, h('table', {},
       h('thead', {}, h('tr', {}, ['Score', 'Business', 'Sector', 'District', 'Why', 'Phone', 'Info collected'].map((c) => h('th', {}, c)))),
-      h('tbody', {}, r.rows.map((p) => h('tr', { onclick: () => go('prospect', { prospectId: p.id, tab: 'overview' }) },
+      h('tbody', {}, r.rows.map((p) => h('tr', { onclick: () => go('prospect', { prospectId: p.id, tab: 'problems' }) },
         h('td', {}, scoreBadge(p.score)),
         h('td', { class: 'name' }, p.name, p.website_url ? h('div', { class: 'small muted mono clip' }, p.website_url) : null),
         h('td', {}, state.me.sectors[p.sector] || p.sector),
@@ -262,6 +369,91 @@
       ] : h('p', { class: 'muted' }, 'Reads this business\'s OpenStreetMap entry and its own website (if it still works) for a description, services, hours, address, phones and emails, to fill the site brief.'));
   }
 
+  // ---------- problems: what is wrong, what it costs them, and a message about it ----------
+  const SEVERITY_BADGE = { critical: ['Critical', 'bad'], high: ['Serious', 'warn'], medium: ['Worth fixing', ''] };
+  const SERVICE_LABEL = { 'new-website': 'New business website', 'website-update': 'Website update or redesign', 'domain-email': '.rw domain and business email', hosting: 'Hosting and monthly updates' };
+
+  async function problemsTab(panel, d, reload) {
+    const p = d.prospect;
+    let r;
+    try { r = await api('GET', `/api/prospects/${p.id}/problems`); } catch (e) { panel.append(h('div', { class: 'card empty' }, e.message)); return; }
+
+    const warnings = r.warnings.length ? h('div', { class: 'stack', style: 'gap:8px' }, r.warnings.map((w) =>
+      h('div', { class: 'card row', style: 'padding:10px 14px' }, h('span', { class: 'badge warn' }, 'Check first'), h('span', { class: 'small' }, w)))) : null;
+
+    if (r.unchecked) {
+      panel.append(h('div', { class: 'card empty' }, r.unchecked));
+      return;
+    }
+    if (!r.issues.length) {
+      panel.append(h('div', { class: 'card empty' }, 'No problems found in the last audit. Their website looks healthy, so there is nothing to offer them here.'));
+      return;
+    }
+
+    const counts = r.issues.reduce((a, x) => ({ ...a, [x.severity]: (a[x.severity] || 0) + 1 }), {});
+    const summary = h('div', { class: 'row' },
+      h('h2', { style: 'margin:0' }, `${r.issues.length} problem${r.issues.length > 1 ? 's' : ''} found`),
+      Object.entries(SEVERITY_BADGE).filter(([k]) => counts[k]).map(([k, [label, cls]]) => h('span', { class: 'badge ' + cls }, `${counts[k]} ${label.toLowerCase()}`)),
+      h('span', { class: 'spacer' }), h('span', { class: 'small muted' }, `From the audit of ${when(r.checked_at)}`));
+
+    const list = h('div', { class: 'stack', style: 'gap:10px' }, r.issues.map((x) => h('div', { class: 'card problem sev-' + x.severity },
+      h('div', { class: 'row' }, h('span', { class: 'badge ' + SEVERITY_BADGE[x.severity][1] }, SEVERITY_BADGE[x.severity][0]), h('h3', { style: 'margin:0' }, x.problem)),
+      h('dl', { class: 'kv' },
+        h('dt', {}, 'What it costs them'), h('dd', {}, x.consequence),
+        h('dt', {}, 'What fixes it'), h('dd', {}, x.fix, SERVICE_LABEL[x.service] ? h('span', { class: 'small muted' }, ` · service: ${SERVICE_LABEL[x.service]}`) : null),
+        x.evidence ? [h('dt', {}, 'Evidence'), h('dd', { class: 'small mono' }, x.evidence)] : null))));
+
+    panel.append(h('div', { class: 'cols wide-left' },
+      h('div', { class: 'stack' }, summary, warnings, list),
+      h('div', { class: 'stack' }, contactCard(p, r, d, reload))));
+  }
+
+  function contactCard(p, r, d, reload) {
+    if (r.do_not_contact) {
+      return h('div', { class: 'card stack' }, h('h2', { style: 'margin:0' }, 'Do not contact'),
+        h('p', {}, 'This business asked not to be contacted. You can read the problems, but no message can be sent.'));
+    }
+    const c = r.contacts;
+    const last = d.outreach.find((o) => o.channel !== 'note');
+    const lang = state.lang === 'rw' ? 'rw' : 'en';
+    const m = r.messages[lang];
+    const subject = h('input', { value: m.subject, 'aria-label': 'Email subject' });
+    const body = h('textarea', { rows: 14, 'aria-label': 'Message' }, m.body);
+    const text = () => `${body.value.trim()}\n\n${m.stop}`;
+    const langBtn = (l, label) => h('button', { class: 'btn', 'aria-pressed': String(lang === l), onclick: () => { state.lang = l; reload(); } }, label);
+
+    // Opening WhatsApp or the email app doesn't send anything; the admin presses send there, then logs it here.
+    const logRow = h('div', { class: 'row', hidden: true });
+    const offerLog = (channel) => {
+      const btn = h('button', { class: 'btn primary' }, `Yes, I sent it on ${channel === 'whatsapp' ? 'WhatsApp' : 'email'}: log it`);
+      btn.onclick = async () => {
+        const ok = await act(btn, () => api('POST', `/api/prospects/${p.id}/outreach`, { channel, message: channel === 'email' ? `${subject.value}\n\n${text()}` : text(), outcome: 'Sent problem report' }), 'Logged on the Outreach tab');
+        if (ok) reload();
+      };
+      logRow.replaceChildren(h('span', { class: 'small muted' }, 'Did you send it?'), btn);
+      logRow.hidden = false;
+    };
+    const wa = h('button', { class: 'btn primary', disabled: !c.whatsapp, title: c.whatsapp ? `Opens WhatsApp to ${c.phone}` : 'No phone number on file' }, 'Open in WhatsApp');
+    wa.onclick = () => { window.open(`https://wa.me/${c.whatsapp}?text=${encodeURIComponent(text())}`, '_blank', 'noopener'); offerLog('whatsapp'); };
+    const mail = h('button', { class: 'btn primary', disabled: !c.email, title: c.email ? `Opens your email app to ${c.email}` : 'No working email on file' }, 'Open in email');
+    mail.onclick = () => { location.href = `mailto:${c.email}?subject=${encodeURIComponent(subject.value)}&body=${encodeURIComponent(text())}`; offerLog('email'); };
+    const copy = h('button', { class: 'btn' }, 'Copy');
+    copy.onclick = () => navigator.clipboard.writeText(text()).then(() => toast('Copied'), () => toast('Copy failed', true));
+
+    return h('div', { class: 'card stack' },
+      h('div', { class: 'row' }, h('h2', { style: 'margin:0' }, 'Contact them about it'), h('span', { class: 'spacer' }), langBtn('en', 'English'), langBtn('rw', 'Kinyarwanda')),
+      h('dl', { class: 'kv' },
+        h('dt', {}, 'WhatsApp'), h('dd', {}, c.whatsapp ? c.phone : h('span', { class: 'muted' }, 'no phone number')),
+        h('dt', {}, 'Email'), h('dd', {}, c.email || h('span', { class: 'muted' }, 'no working email')),
+        h('dt', {}, 'Last contact'), h('dd', {}, last ? `${last.channel} · ${when(last.sent_at)}${last.outcome ? ` · ${last.outcome}` : ''}` : 'never')),
+      h('label', { class: 'f' }, 'Email subject', subject),
+      h('label', { class: 'f' }, 'Message (edit it before sending)', body),
+      h('div', { class: 'small muted' }, 'Always added at the end: ', h('span', { class: 'mono' }, m.stop)),
+      h('div', { class: 'row' }, wa, mail, copy),
+      logRow,
+      h('p', { class: 'small muted' }, lang === 'rw' ? 'Read the Kinyarwanda text before sending and correct anything that sounds unnatural.' : 'Sent messages are logged on the Outreach tab. If they ask you to stop, press "They asked us to stop" there.'));
+  }
+
   function addProspectDialog() {
     const name = h('input', { required: true });
     const sector = h('select', {}, Object.entries(state.me.sectors).map(([k, l]) => h('option', { value: k, selected: k === 'generic' }, l)));
@@ -287,19 +479,26 @@
     const p = d.prospect;
     const reload = () => render();
 
-    const stageSel = h('select', { 'aria-label': 'Stage', onchange: (e) => act(null, () => api('PATCH', `/api/prospects/${p.id}`, { stage: e.target.value }), 'Stage updated') },
-      state.me.stages.map((s) => h('option', { value: s, selected: p.stage === s }, s)));
+    const stageSel = h('select', { 'aria-label': 'Stage', title: 'Where this business is in your sales process',
+      onchange: async (e) => { if (await act(null, () => api('PATCH', `/api/prospects/${p.id}`, { stage: e.target.value }), `Stage: ${stageLabel(e.target.value)}`)) reload(); else e.target.value = p.stage; } },
+      state.me.stages.map((s) => h('option', { value: s, selected: p.stage === s }, stageLabel(s))));
+    const BACK = { pipeline: 'Pipeline', opportunities: 'Opportunities', clients: 'Hosting clients', compliance: 'Compliance' };
+    const backTo = BACK[state.backTo] ? state.backTo : 'pipeline';
+    const site = p.website_url ? (/^https?:\/\//i.test(p.website_url) ? p.website_url : `https://${p.website_url}`) : null;
     main.append(
-      h('button', { class: 'btn back', onclick: () => go('pipeline') }, '← Pipeline'),
-      h('div', { class: 'detail-head' }, scoreBadge(p.score), h('h1', {}, p.name), statusBadge(p.website_status), stageSel,
-        p.do_not_contact ? h('span', { class: 'badge bad' }, 'Do not contact') : null));
+      h('button', { class: 'btn back', onclick: () => go(backTo) }, SF.icon('arrowLeft', 'sm'), BACK[backTo]),
+      h('div', { class: 'detail-head' }, scoreBadge(p.score), h('h1', {}, p.name), statusBadge(p.website_status),
+        h('label', { class: 'check stage-pick' }, h('span', { class: 'small muted' }, 'Stage'), stageSel),
+        p.do_not_contact ? h('span', { class: 'badge bad' }, 'Do not contact') : null),
+      h('p', { class: 'detail-sub' }, [state.me.sectors[p.sector] || p.sector, p.district, p.sector_admin].filter(Boolean).join(' · '),
+        site ? [' · ', h('a', { href: site, target: '_blank', rel: 'noopener noreferrer' }, p.website_url)] : ' · no website known'));
 
-    const TABS = [['overview', 'Overview'], ['google', 'Google'], ['site', 'Site'], ['outreach', 'Outreach'], ['client', d.client ? 'Client' : 'Make client'], ['data', 'Data']];
+    const TABS = [['overview', 'Overview'], ['problems', 'Problems'], ['google', 'Google'], ['site', 'Site'], ['outreach', 'Outreach'], ['client', d.client ? 'Hosting client' : 'Make hosting client'], ['data', 'Data']];
     main.append(h('div', { class: 'tabs', role: 'tablist' }, TABS.map(([k, l]) =>
       h('button', { role: 'tab', 'aria-selected': String(state.tab === k), onclick: () => go('prospect', { tab: k }) }, l))));
     const panel = h('div', { role: 'tabpanel' });
     main.append(panel);
-    ({ overview: overviewTab, google: googleTab, site: siteTab, outreach: outreachTab, client: clientTab, data: dataTab })[state.tab](panel, d, reload);
+    ({ overview: overviewTab, problems: problemsTab, google: googleTab, site: siteTab, outreach: outreachTab, client: clientTab, data: dataTab })[state.tab](panel, d, reload);
   }
 
   function overviewTab(panel, d, reload) {
@@ -329,7 +528,7 @@
     const scoreCard = h('div', { class: 'card stack' },
       h('div', { class: 'row' }, h('h2', { style: 'margin:0' }, 'Website score'), h('span', { class: 'spacer' }), auditBtn),
       b ? [
-        h('p', {}, `Raw ${b.raw}/100 × sector factor ${b.wtp} = `, h('b', {}, String(b.score))),
+        h('p', { class: 'small' }, `${b.raw} points for the problems below × ${b.wtp} for this sector (how likely this kind of business is to pay) = score `, h('b', {}, String(b.score)), '.'),
         b.breakdown.length ? h('div', { class: 'stack', style: 'gap:8px' }, b.breakdown.map((x) => h('div', { class: 'bar' },
           h('span', {}, x.label), h('b', {}, `+${x.points}`), h('div', { class: 'track' }, h('div', { class: 'fill', style: `width:${Math.min(100, x.points * 2.5)}%` }))))) : h('p', { class: 'muted' }, 'No problems found: the site looks healthy.')
       ] : h('p', { class: 'muted' }, 'Not audited yet.'));
@@ -340,7 +539,7 @@
           a.http_status ? h('span', { class: 'badge' }, `HTTP ${a.http_status}`) : null, a.load_ms != null ? h('span', { class: 'badge' }, `${a.load_ms} ms`) : null,
           a.cms_detected ? h('span', { class: 'badge' }, a.cms_detected) : null),
         a.final_url ? h('div', { class: 'small mono' }, a.final_url) : null,
-        a.signals?.website_source ? h('div', { class: 'small muted' }, `Website from: ${a.signals.website_source}`) : null,
+        a.signals?.website_source ? h('div', { class: 'small muted' }, `Website address from: ${({ osm: 'OpenStreetMap', rdb: 'RDB list', csv: 'your CSV list', visit: 'you (visit)', manual: 'you', google: 'Google', 'none-recorded': 'nowhere (no website known)' })[a.signals.website_source] || a.signals.website_source}`) : null,
         (a.signals?.notes || []).map((n) => h('div', { class: 'small muted' }, n))))) : h('p', { class: 'muted' }, 'None yet.'));
 
     panel.append(h('div', { class: 'cols' }, h('div', { class: 'stack' }, form, researchCard(d, reload)), h('div', { class: 'stack' }, scoreCard, audits)));
@@ -550,7 +749,8 @@
       panel.append(h('form', { class: 'card stack', onsubmit: async (e) => {
         e.preventDefault();
         if (await act(btn, () => api('POST', `/api/prospects/${p.id}/client`, Object.fromEntries(Object.entries(f).map(([k, el]) => [k, el.value]))), 'Client created')) reload();
-      } }, h('h2', {}, 'They said yes'),
+      } }, h('h2', {}, 'They said yes: make them a hosting client'),
+        h('p', { class: 'muted small' }, 'For businesses you host and bill every month. Orders placed in the client portal are handled under Client portal instead.'),
         h('div', { class: 'grid2' }, h('label', { class: 'f' }, 'Contact person', f.contact_name), h('label', { class: 'f' }, 'Phone', f.phone),
           h('label', { class: 'f' }, 'Setup fee (RWF)', f.setup_fee), h('label', { class: 'f' }, 'Monthly fee (RWF)', f.monthly_fee), h('label', { class: 'f' }, 'Plan', f.plan)),
         h('p', { class: 'muted small' }, 'Put in the contract what happens if they leave: whether they get an HTML export of the site or not.'),
@@ -622,7 +822,7 @@
     const renew = h('button', { class: 'btn' }, 'Check renewals now');
     renew.onclick = async () => { if (await act(renew, () => api('POST', '/api/renewals/check', {}), (x) => `${x.newly_overdue} overdue, ${x.suspended} suspended`)) render(); };
     const mrr = r.rows.filter((c) => c.status === 'active' || c.status === 'overdue').reduce((s, c) => s + c.monthly_fee, 0);
-    main.append(h('div', { class: 'row', style: 'margin-bottom:12px' }, h('h1', {}, 'Clients'), h('span', { class: 'badge info' }, `${rwf(mrr)} / month`), h('span', { class: 'spacer' }), renew));
+    main.append(h('div', { class: 'row', style: 'margin-bottom:12px' }, h('h1', {}, 'Hosting clients'), h('span', { class: 'badge info' }, `${rwf(mrr)} / month`), h('span', { class: 'spacer' }), renew));
     if (!r.rows.length) { main.append(h('div', { class: 'card empty' }, 'No clients yet. Open a prospect and use "Make client" when they say yes.')); return; }
     main.append(h('div', { class: 'tablewrap' }, h('table', {},
       h('thead', {}, h('tr', {}, ['Business', 'Status', 'Paid until', 'Monthly', 'Total paid', 'Domain / URL'].map((c) => h('th', {}, c)))),
@@ -632,6 +832,256 @@
         h('td', {}, c.next_invoice_at), h('td', { class: 'num' }, fmt(c.monthly_fee)), h('td', { class: 'num' }, fmt(c.total_paid)),
         h('td', { class: 'small' }, c.domain || c.live_url || '–')))))));
     main.append(h('p', { class: 'muted small' }, 'Past the paid-until date a client turns overdue. After 30 more days the site is replaced by a "renewing" page until they pay.'));
+  }
+
+  // ---------- client portal: orders, services, accounts ----------
+  const ORDER_STATUS = {
+    awaiting_deposit: ['Waiting for deposit', 'warn'], in_progress: ['In progress', 'info'],
+    awaiting_final: ['Final payment due', 'warn'], completed: ['Completed', 'good'], cancelled: ['Cancelled', '']
+  };
+  const LANG_NAME = { en: 'English', rw: 'Kinyarwanda', fr: 'French' };
+  const orderBadge = (s) => h('span', { class: 'badge ' + (ORDER_STATUS[s]?.[1] || '') }, ORDER_STATUS[s]?.[0] || s);
+  const payBadge = (s) => h('span', { class: 'badge ' + ({ confirmed: 'good', pending: 'warn', rejected: 'bad' }[s] || '') }, { confirmed: 'Confirmed', pending: 'To check', rejected: 'Rejected' }[s] || s);
+  const payKind = (k) => (k === 'deposit' ? 'Deposit' : 'Balance');
+
+  // Shows the number of payments waiting to be checked next to "Portal" in the top bar.
+  async function refreshPortalBadge() {
+    const el = document.getElementById('portal-badge');
+    if (!el) return;
+    try {
+      const r = await api('GET', '/api/orders?summary=1');
+      el.textContent = r.summary.pending_payments ? String(r.summary.pending_payments) : '';
+      el.hidden = !r.summary.pending_payments;
+    } catch (e) { el.hidden = true; }
+  }
+
+  async function portalView(main) {
+    const TABS = [['orders', 'Orders'], ['services', 'Services'], ['accounts', 'Client accounts']];
+    main.append(
+      h('div', { class: 'row', style: 'margin-bottom:8px' }, h('h1', {}, 'Client portal'), h('span', { class: 'spacer' }),
+        h('a', { class: 'btn', href: '/portal/', target: '_blank', rel: 'noopener' }, 'Open the portal as a client sees it')),
+      h('div', { class: 'tabs', role: 'tablist' }, TABS.map(([k, l]) =>
+        h('button', { role: 'tab', 'aria-selected': String(state.portalTab === k), onclick: () => go('portal', { portalTab: k }) }, l))));
+    const panel = h('div', { role: 'tabpanel' });
+    main.append(panel);
+    await ({ orders: portalOrdersTab, services: portalServicesTab, accounts: portalAccountsTab }[state.portalTab] || portalOrdersTab)(panel);
+  }
+
+  async function portalOrdersTab(panel) {
+    const f = state.orderFilter;
+    const r = await api('GET', '/api/orders?' + new URLSearchParams(f ? { status: f } : {})).catch((e) => { toast(e.message, true); return null; });
+    if (!r) return;
+    const s = r.summary;
+    const stat = (key, label, n) => h('button', { class: 'stat', 'aria-pressed': String(f === key), onclick: () => { state.orderFilter = key; render(); } }, h('b', {}, fmt(n)), h('span', {}, label));
+    const total = Object.values(s.counts).reduce((a, b) => a + b, 0);
+    if (r.payment) {
+      const m = r.payment.merchant;
+      panel.append(h('div', { class: 'card pay-info' },
+        m ? h('img', { src: m.qr, alt: `QR code for ${m.ussd}`, class: 'pay-qr' }) : null,
+        h('div', { class: 'stack', style: 'gap:4px' },
+          h('span', { class: 'small muted' }, 'Clients pay by MTN MoMo'),
+          m ? h('div', {}, h('b', {}, `MoMo Pay ${m.code}`), ` (${m.name}) · dial `, h('span', { class: 'mono' }, m.ussd), ' or scan the QR code') : null,
+          r.payment.number ? h('div', {}, h('b', {}, r.payment.number), ` (${r.payment.name}) · send to this number`) : null,
+          h('span', { class: 'small muted' }, 'Set in .env: MOMO_MERCHANT_CODE, MOMO_MERCHANT_NAME, MOMO_PAY_NUMBER, MOMO_PAY_NAME.'))));
+    }
+    if (!r.momo_configured) {
+      panel.append(h('p', { class: 'card', style: 'margin-bottom:12px' }, h('span', { class: 'badge warn' }, 'Set up payments'),
+        ' Clients can\'t see where to pay yet. Add MOMO_PAY_NUMBER and MOMO_PAY_NAME to .env and restart the server.'));
+    }
+    panel.append(h('div', { class: 'stats' },
+      stat('', 'All orders', total),
+      Object.entries(ORDER_STATUS).map(([k, [label]]) => stat(k, label, s.counts[k]))),
+      h('p', { class: 'muted small', style: 'margin:-6px 0 12px' },
+        `${fmt(s.accounts)} client accounts · ${rwf(s.received)} received through the portal`,
+        s.pending_payments ? [' · ', h('span', { class: 'badge warn' }, `${s.pending_payments} payment${s.pending_payments > 1 ? 's' : ''} to check`)] : null));
+    if (!r.rows.length) {
+      panel.append(h('div', { class: 'card empty' }, total ? 'No orders with this status.' : 'No orders yet. When a client orders a service in the portal, it appears here.'));
+      return;
+    }
+    panel.append(h('div', { class: 'tablewrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, ['#', 'Client', 'Service', 'Price', 'Status', 'Progress', 'Payments', 'Updated'].map((c) => h('th', {}, c)))),
+      h('tbody', {}, r.rows.map((o) => h('tr', { onclick: () => go('order', { orderId: o.id }) },
+        h('td', { class: 'mono small' }, `#${o.id}`),
+        h('td', { class: 'name' }, o.company, h('div', { class: 'small muted' }, o.client_name)),
+        h('td', {}, o.service_name),
+        h('td', { class: 'num' }, fmt(o.price)),
+        h('td', {}, orderBadge(o.status)),
+        h('td', {}, o.status === 'in_progress' ? `${o.progress}%` : ''),
+        h('td', {}, o.pending_payments ? h('span', { class: 'badge warn' }, 'to check') : h('span', { class: 'small muted' }, `${fmt(o.paid)} paid`)),
+        h('td', { class: 'muted small' }, when(o.updated_at))))))));
+  }
+
+  async function orderView(main) {
+    let o;
+    try { o = await api('GET', `/api/orders/${state.orderId}`); } catch (e) { main.append(h('div', { class: 'card empty' }, e.message)); return; }
+    const reload = () => { render(); refreshPortalBadge(); };
+    const c = o.client || {};
+    main.append(
+      h('button', { class: 'btn back', onclick: () => go('portal', { portalTab: 'orders' }) }, SF.icon('arrowLeft', 'sm'), 'Orders'),
+      h('div', { class: 'detail-head' }, h('h1', {}, `#${o.id} · ${o.service_name}`), orderBadge(o.status), h('span', { class: 'muted' }, c.company)));
+
+    // Client and request
+    const wa = c.phone ? `https://wa.me/${c.phone.replace(/\D/g, '')}` : null;
+    const clientCard = h('div', { class: 'card stack' }, h('h2', { style: 'margin:0' }, 'Client'),
+      h('dl', { class: 'kv' },
+        h('dt', {}, 'Name'), h('dd', {}, c.name || '–'), h('dt', {}, 'Business'), h('dd', {}, c.company || '–'),
+        h('dt', {}, 'Phone'), h('dd', {}, c.phone ? [c.phone, ' · ', h('a', { href: wa, target: '_blank', rel: 'noopener noreferrer' }, 'WhatsApp')] : '–'),
+        h('dt', {}, 'Email'), h('dd', {}, c.email ? h('a', { href: `mailto:${c.email}` }, c.email) : '–'),
+        h('dt', {}, 'Website'), h('dd', {}, o.website || '–'),
+        h('dt', {}, 'Language'), h('dd', {}, LANG_NAME[c.lang] || 'English', c.lang && c.lang !== 'en' ? h('span', { class: 'small muted' }, ' · they read the portal in this language; reply in it if you can') : null),
+        h('dt', {}, 'Ordered'), h('dd', {}, when(o.created_at))),
+      h('div', {}, h('div', { class: 'small muted' }, 'What they asked for'), h('div', { class: 'msg' }, o.details)));
+
+    const paid = o.payments.filter((p) => p.status === 'confirmed').reduce((a, p) => a + p.amount, 0);
+    const moneyCard = h('div', { class: 'card stack' }, h('h2', { style: 'margin:0' }, 'Money'),
+      h('dl', { class: 'kv' },
+        h('dt', {}, 'Price'), h('dd', {}, rwf(o.price)), h('dt', {}, 'Deposit'), h('dd', {}, rwf(o.deposit)),
+        h('dt', {}, 'Balance'), h('dd', {}, rwf(o.balance)), h('dt', {}, 'Received'), h('dd', {}, h('b', {}, rwf(paid))),
+        h('dt', {}, 'Due now'), h('dd', {}, o.due ? `${rwf(o.due.amount)} (${payKind(o.due.kind).toLowerCase()})` : 'nothing')),
+      o.payments.length ? h('ul', { class: 'list' }, o.payments.map((p) => {
+        const item = h('li', { class: 'stack', style: 'gap:6px' },
+          h('div', { class: 'row' }, h('b', {}, rwf(p.amount)), h('span', { class: 'small muted' }, payKind(p.kind)), payBadge(p.status), h('span', { class: 'spacer' }), h('span', { class: 'small muted' }, when(p.submitted_at))),
+          h('div', { class: 'small mono' }, `MoMo ID ${p.momo_txid}${p.payer_phone ? ` · from ${p.payer_phone}` : ''}`),
+          p.reviewed_by ? h('div', { class: 'small muted' }, `${p.status} by ${p.reviewed_by} · ${when(p.reviewed_at)}${p.review_note ? ` · ${p.review_note}` : ''}`) : null);
+        if (p.status === 'pending') {
+          const ok = h('button', { class: 'btn primary' }, 'Confirm: money received');
+          const reason = h('input', { placeholder: 'Reason, e.g. not on our MoMo statement', style: 'flex:1;min-width:200px' });
+          const no = h('button', { class: 'btn danger' }, 'Reject');
+          ok.onclick = async () => { if (await act(ok, () => api('POST', `/api/order-payments/${p.id}/review`, { approve: true }), 'Payment confirmed')) reload(); };
+          no.onclick = async () => { if (await act(no, () => api('POST', `/api/order-payments/${p.id}/review`, { approve: false, note: reason.value }), 'Payment rejected; the client sees your reason')) reload(); };
+          item.append(h('p', { class: 'small muted' }, 'Check your MoMo statement for this transaction ID and amount before confirming.'), h('div', { class: 'row' }, ok), h('div', { class: 'row' }, reason, no));
+        }
+        return item;
+      })) : h('p', { class: 'muted small' }, 'No payments reported yet.'));
+
+    // Delivery
+    let deliveryCard = null;
+    if (o.status === 'in_progress') {
+      const url = h('input', { placeholder: 'https://… (the finished site, a file link…)' });
+      const note = h('textarea', { rows: 4, placeholder: 'What you hand over: links, login details, instructions. The client sees this only after the final payment.' });
+      const fin = h('button', { class: 'btn primary' }, 'Mark work finished and ask for the balance');
+      fin.onclick = async () => { if (await act(fin, () => api('POST', `/api/orders/${o.id}/finish`, { result_url: url.value, delivery_note: note.value }), 'Client asked for the final payment')) reload(); };
+      deliveryCard = h('div', { class: 'card stack' }, h('h2', { style: 'margin:0' }, 'Deliver'),
+        h('label', { class: 'f' }, 'Result link', url), h('label', { class: 'f' }, 'Hand-over note', note), h('div', {}, fin));
+    } else if (o.delivery_note || o.result_url) {
+      deliveryCard = h('div', { class: 'card stack' }, h('h2', { style: 'margin:0' }, 'Delivery'),
+        o.result_url ? h('a', { href: o.result_url, target: '_blank', rel: 'noopener noreferrer' }, o.result_url) : null,
+        o.delivery_note ? h('div', { class: 'msg' }, o.delivery_note) : null,
+        h('p', { class: 'small muted' }, o.status === 'completed' ? 'The client can see this.' : 'Hidden from the client until the final payment is confirmed.'));
+    }
+
+    let cancelCard = null;
+    if (!['completed', 'cancelled'].includes(o.status)) {
+      const why = h('input', { placeholder: 'Reason (the client sees it)', style: 'flex:1;min-width:200px' });
+      const cancel = h('button', { class: 'btn danger' }, 'Cancel order');
+      cancel.onclick = async () => {
+        if (!confirm(paid ? `The client has paid ${rwf(paid)}. Refunds are handled outside the system. Cancel anyway?` : 'Cancel this order?')) return;
+        if (await act(cancel, () => api('POST', `/api/orders/${o.id}/cancel`, { reason: why.value }), 'Order cancelled')) reload();
+      };
+      cancelCard = h('div', { class: 'card stack' }, h('h2', { style: 'margin:0' }, 'Cancel order'),
+        h('p', { class: 'small muted' }, 'The client sees your reason on their order page. Money already paid is refunded outside SiteForge, by agreement with the client.'),
+        h('div', { class: 'row' }, why, cancel));
+    }
+
+    // Timeline with a box to post progress
+    const msg = h('textarea', { rows: 3, placeholder: 'Progress for the client, e.g. "Design approved, building the pages now."' });
+    const prog = h('input', { type: 'number', min: 0, max: 100, step: 5, value: o.progress, style: 'width:90px', 'aria-label': 'Progress percent' });
+    const post = h('button', { class: 'btn primary' }, 'Post update');
+    post.onclick = async () => {
+      const body = { message: msg.value };
+      if (o.status === 'in_progress') body.progress = prog.value;
+      if (await act(post, () => api('POST', `/api/orders/${o.id}/updates`, body), 'Update posted')) reload();
+    };
+    const timeline = h('div', { class: 'card stack' }, h('h2', { style: 'margin:0' }, 'Updates the client sees'),
+      o.status !== 'cancelled' ? h('div', { class: 'stack', style: 'gap:8px' }, msg,
+        h('div', { class: 'row' }, o.status === 'in_progress' ? [h('label', { class: 'check' }, 'Progress', prog, '%')] : null, h('span', { class: 'spacer' }), post)) : null,
+      h('ul', { class: 'list' }, o.updates.slice().reverse().map((u) => h('li', {},
+        h('div', { class: 'row small muted' }, h('span', { class: 'badge ' + ({ admin: 'info', client: 'good' }[u.author] || '') }, u.author === 'admin' ? `you (${u.author_name || 'admin'})` : u.author === 'client' ? 'client' : 'automatic'),
+          when(u.created_at), u.progress != null ? `· ${u.progress}%` : null),
+        h('div', { class: 'msg', style: 'background:none;padding:4px 0 0' }, u.message)))));
+
+    main.append(h('div', { class: 'cols' }, h('div', { class: 'stack' }, clientCard, moneyCard, deliveryCard, cancelCard), h('div', { class: 'stack' }, timeline)));
+  }
+
+  async function portalServicesTab(panel) {
+    const r = await api('GET', '/api/services').catch((e) => { toast(e.message, true); return null; });
+    if (!r) return;
+    panel.append(h('p', { class: 'muted', style: 'margin:0 0 12px' },
+      `Clients see a service only when it has a price and "Show to clients" is on. They pay ${r.advance_percent}% to start and the rest when you mark the work finished. Price changes don't affect orders already placed.`));
+    const rowFor = (s) => {
+      const f = {
+        name: h('input', { value: s.name, 'aria-label': 'Name' }),
+        price: h('input', { type: 'number', min: 0, step: 1000, value: s.price ?? '', placeholder: 'RWF', style: 'width:130px', 'aria-label': 'Price in RWF' }),
+        delivery_days: h('input', { type: 'number', min: 1, max: 365, value: s.delivery_days ?? '', style: 'width:80px', 'aria-label': 'Days to deliver' }),
+        active: h('input', { type: 'checkbox', checked: Boolean(s.active) }),
+        description: h('textarea', { rows: 2, 'aria-label': 'Description' }, s.description || '')
+      };
+      const tr = {};
+      for (const l of ['rw', 'fr']) {
+        tr[l] = {
+          name: h('input', { value: s.i18n?.[l]?.name || '', 'aria-label': `Name in ${LANG_NAME[l]}` }),
+          description: h('textarea', { rows: 2, 'aria-label': `Description in ${LANG_NAME[l]}` }, s.i18n?.[l]?.description || '')
+        };
+      }
+      const i18nBody = () => Object.fromEntries(Object.entries(tr).map(([l, x]) => [l, { name: x.name.value, description: x.description.value }]));
+      const translated = ['rw', 'fr'].filter((l) => s.i18n?.[l]?.name).map((l) => LANG_NAME[l]);
+      const save = h('button', { class: 'btn primary' }, s.id ? 'Save' : 'Add service');
+      save.onclick = async () => {
+        const body = { name: f.name.value, price: f.price.value, delivery_days: f.delivery_days.value, active: f.active.checked, description: f.description.value, i18n: i18nBody() };
+        if (await act(save, () => (s.id ? api('PATCH', `/api/services/${s.id}`, body) : api('POST', '/api/services', body)), s.id ? 'Saved' : 'Service added')) render();
+      };
+      return h('div', { class: 'card stack', style: 'gap:10px' },
+        h('div', { class: 'row' }, h('label', { class: 'f', style: 'flex:1;min-width:220px' }, 'Name', f.name),
+          h('label', { class: 'f' }, 'Price (RWF)', f.price), h('label', { class: 'f' }, 'Days', f.delivery_days),
+          h('label', { class: 'check', style: 'align-self:end;min-height:34px' }, f.active, 'Show to clients')),
+        h('label', { class: 'f' }, 'What the client gets', f.description),
+        h('details', { class: 'translations' },
+          h('summary', {}, 'Translations', h('span', { class: 'small muted' }, translated.length ? ` · ${translated.join(', ')}` : ' · none yet: clients see the English text')),
+          h('div', { class: 'grid2', style: 'margin-top:10px' }, ['rw', 'fr'].map((l) => h('div', { class: 'stack', style: 'gap:8px' },
+            h('b', { class: 'small' }, LANG_NAME[l]),
+            h('label', { class: 'f' }, 'Name', tr[l].name),
+            h('label', { class: 'f' }, 'What the client gets', tr[l].description))))),
+        h('div', { class: 'row' }, s.id ? h('span', { class: 'small muted' }, `${fmt(s.orders)} order${s.orders === 1 ? '' : 's'}`) : h('span', { class: 'small muted' }, 'New service'),
+          s.id && !(s.price > 0) ? h('span', { class: 'badge warn' }, 'no price yet: hidden') : s.id && s.active ? h('span', { class: 'badge good' }, 'visible to clients') : s.id ? h('span', { class: 'badge' }, 'hidden') : null,
+          h('span', { class: 'spacer' }), save));
+    };
+    panel.append(h('div', { class: 'stack' }, r.rows.map(rowFor), h('h2', { style: 'margin:8px 0 0' }, 'Add a service'), rowFor({ name: '', description: '', price: null, delivery_days: null, active: 0 })));
+  }
+
+  async function portalAccountsTab(panel) {
+    const r = await api('GET', '/api/accounts').catch((e) => { toast(e.message, true); return null; });
+    if (!r) return;
+    if (!r.rows.length) { panel.append(h('div', { class: 'card empty' }, 'No client accounts yet. Clients create one at /portal/.')); return; }
+    const showOnce = (title, text) => {
+      const dlg = h('dialog', {}, h('div', { class: 'stack' }, h('h2', {}, title), h('div', { class: 'msg mono' }, text),
+        h('p', { class: 'small muted' }, 'This is shown only once. Send it to the client (for example on WhatsApp) and ask them to change it under Account.'),
+        h('div', { class: 'row' }, h('span', { class: 'spacer' }), h('button', { class: 'btn primary', onclick: () => { dlg.close(); dlg.remove(); } }, 'Done'))));
+      document.body.append(dlg);
+      dlg.showModal();
+    };
+    panel.append(h('div', { class: 'tablewrap' }, h('table', {},
+      h('thead', {}, h('tr', {}, ['Business', 'Name', 'Phone', 'Email', 'Language', 'Orders', 'Joined', 'Last login', ''].map((c) => h('th', {}, c)))),
+      h('tbody', {}, r.rows.map((u) => {
+        const reset = h('button', { class: 'btn' }, 'Reset password');
+        reset.onclick = async () => {
+          if (!confirm(`Give ${u.name} a new temporary password? Their current password stops working.`)) return;
+          const x = await act(reset, () => api('POST', `/api/accounts/${u.id}/reset-password`, {}));
+          if (x) showOnce(`Temporary password for ${u.name}`, x.temporary_password);
+        };
+        const erase = h('button', { class: 'btn danger' }, 'Delete');
+        erase.onclick = async () => {
+          const typed = prompt(`Delete ${u.name}'s personal details? Orders and payments are kept without their name, phone or email. Type DELETE to confirm.`);
+          if (typed !== 'DELETE') return;
+          if (await act(erase, () => api('POST', `/api/accounts/${u.id}/erase`, { confirm: 'DELETE' }), 'Account deleted')) render();
+        };
+        return h('tr', {},
+          h('td', { class: 'name' }, u.company), h('td', {}, u.name), h('td', { class: 'small' }, u.phone || '–'), h('td', { class: 'small' }, u.email || '–'),
+          h('td', { class: 'small' }, LANG_NAME[u.lang] || 'English'),
+          h('td', {}, `${fmt(u.orders)}${u.open_orders ? ` (${u.open_orders} open)` : ''}`),
+          h('td', { class: 'small muted' }, when(u.created_at)), h('td', { class: 'small muted' }, when(u.last_login_at) || '–'),
+          h('td', {}, h('div', { class: 'row' }, reset, h('a', { class: 'btn', href: `/api/accounts/${u.id}/export`, download: `account-${u.id}.json` }, 'Export'), erase)));
+      })))));
+    panel.append(h('p', { class: 'muted small' }, 'Law Nº 058/2021: Export gives a client everything we hold about them. Delete removes their personal details but keeps orders and payments as business records.'));
   }
 
   // ---------- import ----------

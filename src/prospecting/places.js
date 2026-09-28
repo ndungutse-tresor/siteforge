@@ -64,13 +64,13 @@ async function findCandidates(name, district) {
   return (json.places || []).map((p) => ({ place_id: p.id, name: p.displayName?.text, address: p.formattedAddress }));
 }
 
-function linkPlace(prospectId, placeId, location) {
+async function linkPlace(prospectId, placeId, location) {
   const sets = ['place_id = ?'], vals = [placeId];
   if (location && typeof location.latitude === 'number') {
-    sets.push('lat = ?', 'lng = ?', "coords_source = 'google'", "coords_fetched_at = datetime('now')");
+    sets.push('lat = ?', 'lng = ?', "coords_source = 'google'", 'coords_fetched_at = now()');
     vals.push(location.latitude, location.longitude);
   }
-  db.prepare(`UPDATE prospects SET ${sets.join(', ')}, updated_at = datetime('now') WHERE id = ?`).run(...vals, prospectId);
+  await db.run(`UPDATE prospects SET ${sets.join(', ')}, updated_at = now() WHERE id = ?`, ...vals, prospectId);
 }
 
 // Website to audit: the business's own URL if we have one, otherwise Google's, live.

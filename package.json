@@ -19,6 +19,10 @@
     "test": "node --test \"test/*.test.js\""
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.128.0"
+    "@anthropic-ai/sdk": "^0.128.0",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8"
   }
 }

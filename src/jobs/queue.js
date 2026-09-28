@@ -1,44 +1,50 @@
 'use strict';
-const { db, tx } = require('../core/db');
+const { db } = require('../core/db');
 
 const MAX_ATTEMPTS = 3;
+// A job still 'running' after this long was lost (its server instance stopped): it runs again.
+const STALE_MINUTES = 10;
 
-function enqueue(kind, payload = {}) {
-  return db.prepare('INSERT INTO jobs (kind, payload) VALUES (?, ?) RETURNING id').get(kind, JSON.stringify(payload)).id;
+async function enqueue(kind, payload = {}) {
+  return (await db.get('INSERT INTO jobs (kind, payload) VALUES (?, ?) RETURNING id', kind, JSON.stringify(payload))).id;
 }
 
-// Atomically takes the oldest runnable job.
-function claim(kinds) {
-  return tx(() => {
-    const job = db.prepare(`SELECT * FROM jobs WHERE status = 'queued' AND run_after <= datetime('now')
-      AND kind IN (${kinds.map(() => '?').join(',')}) ORDER BY id LIMIT 1`).get(...kinds);
-    if (!job) return null;
-    db.prepare("UPDATE jobs SET status = 'running', attempts = attempts + 1 WHERE id = ?").run(job.id);
-    return { ...job, attempts: job.attempts + 1, payload: JSON.parse(job.payload) };
-  });
+// Atomically takes the oldest runnable job. SKIP LOCKED lets several instances work side by side.
+async function claim(kinds) {
+  const job = await db.get(`UPDATE jobs SET status = 'running', attempts = attempts + 1, started_at = now()
+    WHERE id = (SELECT id FROM jobs WHERE status = 'queued' AND run_after <= now()
+      AND kind IN (${kinds.map(() => '?').join(',')}) ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
+    RETURNING *`, ...kinds);
+  return job ? { ...job, payload: JSON.parse(job.payload) } : null;
 }
 
-function complete(id) {
-  db.prepare("UPDATE jobs SET status = 'done', error = NULL, finished_at = datetime('now') WHERE id = ?").run(id);
+async function complete(id) {
+  await db.run("UPDATE jobs SET status = 'done', error = NULL, finished_at = now() WHERE id = ?", id);
 }
 
 // Retries with a growing delay, then gives up.
-function fail(job, err) {
+async function fail(job, err) {
+  const msg = String(err?.message || err).slice(0, 1000);
   if (job.attempts >= MAX_ATTEMPTS) {
-    db.prepare("UPDATE jobs SET status = 'failed', error = ?, finished_at = datetime('now') WHERE id = ?").run(String(err.message || err), job.id);
+    await db.run("UPDATE jobs SET status = 'failed', error = ?, finished_at = now() WHERE id = ?", msg, job.id);
   } else {
-    db.prepare("UPDATE jobs SET status = 'queued', error = ?, run_after = datetime('now', ?) WHERE id = ?")
-      .run(String(err.message || err), `+${job.attempts * 5} minutes`, job.id);
+    await db.run("UPDATE jobs SET status = 'queued', error = ?, run_after = now() + (?::int * interval '5 minutes') WHERE id = ?",
+      msg, job.attempts, job.id);
   }
 }
 
-// Jobs left 'running' by a crashed worker go back in the queue.
-function recoverStale() {
-  return db.prepare("UPDATE jobs SET status = 'queued' WHERE status = 'running'").run().changes;
+// Jobs left 'running' by a stopped worker go back in the queue.
+async function recoverStale() {
+  return (await db.run(`UPDATE jobs SET status = 'queued'
+    WHERE status = 'running' AND (started_at IS NULL OR started_at < now() - (?::int * interval '1 minute'))`, STALE_MINUTES)).changes;
 }
 
-function counts() {
-  return db.prepare('SELECT kind, status, COUNT(*) AS n FROM jobs GROUP BY kind, status').all();
+async function counts() {
+  return db.all('SELECT kind, status, COUNT(*) AS n FROM jobs GROUP BY kind, status');
 }
 
-module.exports = { enqueue, claim, complete, fail, recoverStale, counts };
+async function pending(kind) {
+  return (await db.get("SELECT COUNT(*) AS n FROM jobs WHERE kind = ? AND status IN ('queued', 'running')", kind)).n;
+}
+
+module.exports = { enqueue, claim, complete, fail, recoverStale, counts, pending, MAX_ATTEMPTS };
