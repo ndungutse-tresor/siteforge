@@ -1,0 +1,40 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "outputDirectory": "public",
+  "regions": ["fra1"],
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 60,
+      "excludeFiles": "{node_modules/@electric-sql/**,data/**,out/**,test/**}"
+    }
+  },
+  "redirects": [
+    { "source": "/", "destination": "/portal/", "permanent": false },
+    { "source": "/portal", "destination": "/portal/", "permanent": false },
+    { "source": "/admin", "destination": "/admin/", "permanent": false }
+  ],
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/index" },
+    { "source": "/preview/(.*)", "destination": "/api/index" },
+    { "source": "/sites/(.*)", "destination": "/api/index" }
+  ],
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "no-referrer" },
+        { "key": "Permissions-Policy", "value": "camera=(), microphone=(), geolocation=(), payment=()" },
+        { "key": "Strict-Transport-Security", "value": "max-age=31536000; includeSubDomains" }
+      ]
+    },
+    {
+      "source": "/(admin|portal|assets)/(.*)",
+      "headers": [
+        { "key": "Content-Security-Policy", "value": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; connect-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'" },
+        { "key": "X-Frame-Options", "value": "DENY" }
+      ]
+    }
+  ]
+}

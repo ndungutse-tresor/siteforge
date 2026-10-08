@@ -37,15 +37,18 @@ const SEED = [
 
 const LANGS = ['rw', 'fr'];
 
-function seedServices() {
-  const ins = db.prepare('INSERT OR IGNORE INTO services (slug, name, description, delivery_days, sort, i18n) VALUES (?, ?, ?, ?, ?, ?)');
-  // Services created before translations existed get them, unless the admin has written their own.
-  const addI18n = db.prepare("UPDATE services SET i18n = ? WHERE slug = ? AND (i18n IS NULL OR i18n = '{}')");
-  SEED.forEach((s, i) => {
-    ins.run(s.slug, s.name, s.description, s.delivery_days, (i + 1) * 10, JSON.stringify(s.i18n || {}));
-    addI18n.run(JSON.stringify(s.i18n || {}), s.slug);
-  });
+async function seedServices() {
+  // New catalogs get the six services; services created before translations existed get them,
+  // unless the admin has written their own.
+  for (const [i, s] of SEED.entries()) {
+    await db.run(`INSERT INTO services (slug, name, description, delivery_days, sort, i18n) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT (slug) DO NOTHING`, s.slug, s.name, s.description, s.delivery_days, (i + 1) * 10, JSON.stringify(s.i18n || {}));
+    await db.run("UPDATE services SET i18n = ? WHERE slug = ? AND (i18n IS NULL OR i18n = '{}')", JSON.stringify(s.i18n || {}), s.slug);
+  }
 }
+// Runs once per server instance, the first time the catalog is used.
+let seeded = null;
+const ensureSeeded = () => (seeded ||= seedServices().catch((e) => { seeded = null; throw e; }));
 
 const parseI18n = (v) => { try { return JSON.parse(v || '{}'); } catch (e) { return {}; } };
 
@@ -60,19 +63,20 @@ function cleanI18n(input, current) {
   }
   return out;
 }
-seedServices();
 
 const fail = (status, message) => Object.assign(new Error(message), { status });
 
 // What clients see.
-function listActive() {
-  return db.prepare(`SELECT id, slug, name, description, price, delivery_days, i18n FROM services
-    WHERE active = 1 AND price > 0 ORDER BY sort, name`).all().map((s) => ({ ...s, i18n: parseI18n(s.i18n) }));
+async function listActive() {
+  await ensureSeeded();
+  return (await db.all(`SELECT id, slug, name, description, price, delivery_days, i18n FROM services
+    WHERE active = 1 AND price > 0 ORDER BY sort, name`)).map((s) => ({ ...s, i18n: parseI18n(s.i18n) }));
 }
 
-function listAll() {
-  return db.prepare(`SELECT s.*, (SELECT COUNT(*) FROM orders o WHERE o.service_id = s.id) AS orders
-    FROM services s ORDER BY s.sort, s.name`).all().map((s) => ({ ...s, i18n: parseI18n(s.i18n) }));
+async function listAll() {
+  await ensureSeeded();
+  return (await db.all(`SELECT s.*, (SELECT COUNT(*) FROM orders o WHERE o.service_id = s.id) AS orders
+    FROM services s ORDER BY s.sort, s.name`)).map((s) => ({ ...s, i18n: parseI18n(s.i18n) }));
 }
 
 function slugify(name) {
@@ -81,8 +85,9 @@ function slugify(name) {
 }
 
 // Create (no id) or update a service. Only fields that are sent are changed.
-function saveService(id, b) {
-  const cur = id ? db.prepare('SELECT * FROM services WHERE id = ?').get(id) : null;
+async function saveService(id, b) {
+  await ensureSeeded();
+  const cur = id ? await db.get('SELECT * FROM services WHERE id = ?', id) : null;
   if (id && !cur) throw fail(404, 'Service not found.');
   const next = { ...(cur || { description: '', price: null, delivery_days: null, active: 0, sort: 1000 }) };
   next.i18n = cleanI18n(b.i18n, parseI18n(cur?.i18n));
@@ -104,16 +109,16 @@ function saveService(id, b) {
   if (next.active && !(next.price > 0)) throw fail(400, 'Set a price before showing this service to clients.');
 
   if (cur) {
-    db.prepare('UPDATE services SET name = ?, description = ?, price = ?, delivery_days = ?, active = ?, sort = ?, i18n = ? WHERE id = ?')
-      .run(next.name, next.description, next.price, next.delivery_days, next.active, next.sort, JSON.stringify(next.i18n), cur.id);
-    const row = db.prepare('SELECT * FROM services WHERE id = ?').get(cur.id);
+    await db.run('UPDATE services SET name = ?, description = ?, price = ?, delivery_days = ?, active = ?, sort = ?, i18n = ? WHERE id = ?',
+      next.name, next.description, next.price, next.delivery_days, next.active, next.sort, JSON.stringify(next.i18n), cur.id);
+    const row = await db.get('SELECT * FROM services WHERE id = ?', cur.id);
     return { ...row, i18n: parseI18n(row.i18n) };
   }
   let slug = slugify(next.name), n = 2;
-  while (db.prepare('SELECT 1 FROM services WHERE slug = ?').get(slug)) slug = `${slugify(next.name)}-${n++}`;
-  const row = db.prepare(`INSERT INTO services (slug, name, description, price, delivery_days, active, sort, i18n)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`).get(slug, next.name, next.description, next.price, next.delivery_days, next.active, next.sort, JSON.stringify(next.i18n));
+  while (await db.get('SELECT 1 FROM services WHERE slug = ?', slug)) slug = `${slugify(next.name)}-${n++}`;
+  const row = await db.get(`INSERT INTO services (slug, name, description, price, delivery_days, active, sort, i18n)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`, slug, next.name, next.description, next.price, next.delivery_days, next.active, next.sort, JSON.stringify(next.i18n));
   return { ...row, i18n: parseI18n(row.i18n) };
 }
 
-module.exports = { listActive, listAll, saveService, seedServices, SEED };
+module.exports = { listActive, listAll, saveService, seedServices, ensureSeeded, SEED };

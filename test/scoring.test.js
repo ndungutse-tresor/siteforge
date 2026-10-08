@@ -1,5 +1,5 @@
 'use strict';
-process.env.DB_FILE = ':memory:'; // auditor.js loads the database; keep tests off the real one
+process.env.DATABASE_URL = 'pglite:memory'; // auditor.js loads the database; keep tests off the real one
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const S = require('../src/scoring/signals');

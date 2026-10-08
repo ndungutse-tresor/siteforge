@@ -16,6 +16,7 @@
     "audit": "node scripts/audit.js",
     "generate": "node scripts/generate.js",
     "cron": "node scripts/cron.js",
+    "copy-data": "node scripts/copy-data.js",
     "test": "node --test \"test/*.test.js\""
   },
   "dependencies": {

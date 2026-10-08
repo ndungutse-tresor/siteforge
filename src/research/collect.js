@@ -107,7 +107,7 @@ function factsFromOsmTags(t) {
 // that was imported before tags were saved.
 async function fromOsm(osmId, prospectId) {
   if (!/^(node|way|relation)\/\d+$/.test(osmId || '')) return null;
-  const saved = db.prepare('SELECT tags FROM osm_tags WHERE prospect_id = ?').get(prospectId);
+  const saved = await db.get('SELECT tags FROM osm_tags WHERE prospect_id = ?', prospectId);
   return osmFound(saved ? JSON.parse(saved.tags) : await fetchOsmTags(osmId));
 }
 
@@ -297,7 +297,7 @@ function completeness(found, prospect = {}) {
 }
 
 async function collectForProspect(prospectId) {
-  const p = db.prepare('SELECT * FROM prospects WHERE id = ?').get(prospectId);
+  const p = await db.get('SELECT * FROM prospects WHERE id = ?', prospectId);
   if (!p) throw new Error(`Prospect ${prospectId} not found`);
   if (p.do_not_contact) throw new Error('This business asked not to be contacted.');
   const sources = [];
@@ -319,13 +319,13 @@ async function collectForProspect(prospectId) {
 
   const found = combine(p, osm, site);
   const data = { found, sources, completeness: completeness(found, p) };
-  db.prepare(`INSERT INTO research (prospect_id, collected_at, data) VALUES (?, datetime('now'), ?)
-    ON CONFLICT(prospect_id) DO UPDATE SET collected_at = excluded.collected_at, data = excluded.data`).run(p.id, JSON.stringify(data));
+  await db.run(`INSERT INTO research (prospect_id, collected_at, data) VALUES (?, now(), ?)
+    ON CONFLICT (prospect_id) DO UPDATE SET collected_at = excluded.collected_at, data = excluded.data`, p.id, JSON.stringify(data));
   return { prospect_id: p.id, ...data };
 }
 
-function getResearch(prospectId) {
-  const r = db.prepare('SELECT collected_at, data FROM research WHERE prospect_id = ?').get(prospectId);
+async function getResearch(prospectId) {
+  const r = await db.get('SELECT collected_at, data FROM research WHERE prospect_id = ?', prospectId);
   return r ? { collected_at: r.collected_at, ...JSON.parse(r.data) } : null;
 }
 

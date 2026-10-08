@@ -32,10 +32,10 @@ module.exports = {
   ADVANCE_PERCENT: Math.min(100, Math.max(1, Number(env('ADVANCE_PERCENT', '50')) || 50)),
   GOOGLE_PLACES_API_KEY: env('GOOGLE_PLACES_API_KEY'),
   ANTHROPIC_API_KEY: env('ANTHROPIC_API_KEY'),
+  DEEPSEEK_API_KEY: env('DEEPSEEK_API_KEY'),
   VERCEL_TOKEN: env('VERCEL_TOKEN'),
   VERCEL_TEAM_ID: env('VERCEL_TEAM_ID'),
   VERCEL_PROJECT: env('VERCEL_PROJECT', 'siteforge-sites'),
-  OUT_DIR: env('OUT_DIR', path.join(ROOT, 'out', 'sites')),
   PROD: env('NODE_ENV') === 'production',
   TRUST_PROXY: env('TRUST_PROXY') === '1'
 };

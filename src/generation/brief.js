@@ -14,8 +14,8 @@ function whatsappDigits(phone) {
 }
 
 // First draft of a brief from collected info (research/collect.js), used until a site is generated.
-function briefFromResearch(prospect) {
-  const r = getResearch(prospect.id)?.found;
+async function briefFromResearch(prospect) {
+  const r = (await getResearch(prospect.id))?.found;
   if (!r) return {};
   const out = {};
   const facts = [r.description || r.about?.[0], ...(r.facts || [])].filter(Boolean);
@@ -30,9 +30,9 @@ function briefFromResearch(prospect) {
 
 // The brief is everything the model and the template may use. Nothing else gets on the site.
 // Starts from the prospect and collected info, then the last brief used for it, then the admin's edits.
-function buildBrief(prospect, overrides = {}) {
-  const last = db.prepare('SELECT brief FROM generated_sites WHERE prospect_id = ? ORDER BY version DESC LIMIT 1').get(prospect.id);
-  const prev = last ? JSON.parse(last.brief) : briefFromResearch(prospect);
+async function buildBrief(prospect, overrides = {}) {
+  const last = await db.get('SELECT brief FROM generated_sites WHERE prospect_id = ? ORDER BY version DESC LIMIT 1', prospect.id);
+  const prev = last ? JSON.parse(last.brief) : await briefFromResearch(prospect);
   const o = { ...prev, ...overrides };
   const languages = list(o.languages || ['rw', 'en']).filter((l) => LANGS[l]);
   const phone = o.phone ?? prospect.contact_phone ?? '';

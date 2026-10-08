@@ -54,7 +54,9 @@ async function connect() {
     const where = url.slice('pglite:'.length);
     const { PGlite } = await import('@electric-sql/pglite');
     if (where && where !== 'memory') fs.mkdirSync(where, { recursive: true });
-    const pg = new PGlite(where && where !== 'memory' ? where : undefined, { parsers: PARSERS });
+    const pg = new PGlite({ dataDir: where && where !== 'memory' ? where : undefined, parsers: PARSERS });
+    // Same clock as Supabase, so "today" and date maths agree between tests and production.
+    await pg.exec("SET TIME ZONE 'UTC'");
     await pg.exec(fs.readFileSync(SCHEMA, 'utf8'));
     const wrap = (c) => ({
       query: async (sql, params) => {

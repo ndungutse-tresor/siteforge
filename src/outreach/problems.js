@@ -142,8 +142,8 @@ function hostOf(url) {
 }
 
 // The latest audit plus what it means. Returns { status, checked_at, issues[], unchecked }.
-function diagnose(prospect) {
-  const a = db.prepare('SELECT * FROM audits WHERE prospect_id = ? ORDER BY checked_at DESC, id DESC LIMIT 1').get(prospect.id);
+async function diagnose(prospect) {
+  const a = await db.get('SELECT * FROM audits WHERE prospect_id = ? ORDER BY checked_at DESC, id DESC LIMIT 1', prospect.id);
   const status = prospect.website_status;
   if (!a || !status) return { status: null, checked_at: null, issues: [], unchecked: 'Not audited yet. Run the audit on the Overview tab first.' };
   if (status === 'blocked' || status === 'robots-blocked') {
@@ -169,7 +169,7 @@ function diagnose(prospect) {
     }
   }
   // An email on the business's own dead domain will bounce.
-  const found = getResearch(prospect.id)?.found;
+  const found = (await getResearch(prospect.id))?.found;
   const emails = [prospect.contact_email, ...(found?.emails || []), ...(found?.dropped_emails || [])].filter(Boolean);
   const deadEmail = status === 'dns-dead' && emails.find((e) => !usableEmails([e], prospect).length);
   if (deadEmail) keys.push('dead_email');
@@ -209,8 +209,8 @@ function diagnose(prospect) {
 }
 
 // Where we can reach them: a phone that works on WhatsApp and an email that won't bounce.
-function contactOptions(prospect) {
-  const found = getResearch(prospect.id)?.found || {};
+async function contactOptions(prospect) {
+  const found = (await getResearch(prospect.id))?.found || {};
   const phone = prospect.contact_phone || found.phones?.[0] || '';
   const email = usableEmails([prospect.contact_email, ...(found.emails || [])].filter(Boolean), prospect)[0] || '';
   return { phone, whatsapp: whatsappDigits(phone), email };
@@ -274,11 +274,11 @@ function warningsFor(prospect, d, contacts) {
   return out;
 }
 
-function problemReport(prospectId) {
-  const p = db.prepare('SELECT * FROM prospects WHERE id = ?').get(prospectId);
+async function problemReport(prospectId) {
+  const p = await db.get('SELECT * FROM prospects WHERE id = ?', prospectId);
   if (!p) throw Object.assign(new Error('Prospect not found'), { status: 404 });
-  const d = diagnose(p);
-  const contacts = contactOptions(p);
+  const d = await diagnose(p);
+  const contacts = await contactOptions(p);
   const messages = d.issues.length && !p.do_not_contact
     ? { en: composeProblemMessage(p, d.issues, 'en'), rw: composeProblemMessage(p, d.issues, 'rw') } : null;
   return { ...d, contacts, messages, warnings: warningsFor(p, d, contacts), do_not_contact: Boolean(p.do_not_contact) };

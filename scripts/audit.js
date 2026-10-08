@@ -17,7 +17,7 @@ const { score } = require('../src/scoring/score');
   }
   const ids = args[0] === '--id'
     ? [Number(args[1])]
-    : db.prepare('SELECT id FROM prospects WHERE score IS NULL AND do_not_contact = 0 ORDER BY id LIMIT ?').all(Number(args[0]) || 200).map((r) => r.id);
+    : (await db.all('SELECT id FROM prospects WHERE score IS NULL AND do_not_contact = 0 ORDER BY id LIMIT ?', Number(args[0]) || 200)).map((r) => r.id);
   if (!ids.length) return console.log('Nothing to audit.');
   console.log(`Auditing ${ids.length} prospect(s), 4 at a time...`);
   let n = 0;
@@ -28,4 +28,4 @@ const { score } = require('../src/scoring/score');
       console.log(`[${n}/${ids.length}] #${r.prospect_id} ${err ? 'ERROR ' + err.message : `${r.website_status} -> score ${r.score}`}`);
     }
   });
-})().catch((e) => { console.error(e.message); process.exit(1); });
+})().catch((e) => { console.error(e.message); process.exitCode = 1; }).finally(() => db.close());

@@ -1,5 +1,5 @@
 'use strict';
-process.env.DB_FILE = ':memory:';
+process.env.DATABASE_URL = 'pglite:memory';
 process.env.ANTHROPIC_API_KEY = '';
 
 const test = require('node:test');
@@ -9,6 +9,8 @@ const R = require('../src/research/collect');
 const { classify } = require('../src/research/opportunity');
 const { buildBrief } = require('../src/generation/brief');
 const { exportProspect, eraseProspect } = require('../src/compliance/export');
+
+test.after(() => db.close());
 
 const PAGE = `<!doctype html><html><head><title>Hotel Umucyo | Kigali</title>
 <meta name="description" content="Family hotel in Kimihurura with 20 rooms &amp; a garden restaurant.">
@@ -61,27 +63,27 @@ test('prospects are sorted into build-new, needs-update, ok and check', () => {
   assert.equal(classify({ website_status: null, score: null }).kind, 'check');
 });
 
-test('collected info pre-fills the brief, is exported and is erased', () => {
-  const id = db.prepare(`INSERT INTO prospects (name, sector, district, website_url, website_status, contact_email)
-    VALUES ('Iwawe Hotel', 'hotel', 'Gasabo', 'https://www.iwawehotel.com/', 'dns-dead', 'reservations@iwawehotel.com') RETURNING id`).get().id;
-  const found = R.combine(db.prepare('SELECT * FROM prospects WHERE id = ?').get(id),
+test('collected info pre-fills the brief, is exported and is erased', async () => {
+  const { id } = await db.get(`INSERT INTO prospects (name, sector, district, website_url, website_status, contact_email)
+    VALUES ('Iwawe Hotel', 'hotel', 'Gasabo', 'https://www.iwawehotel.com/', 'dns-dead', 'reservations@iwawehotel.com') RETURNING id`);
+  const found = R.combine(await db.get('SELECT * FROM prospects WHERE id = ?', id),
     { found: { description: 'Hotel on Boulevard de l\'Umuganda.', facts: ['3-star hotel'], hours: ['Open 24 hours'], phones: ['+250 733 304 142'], emails: ['reservations@iwawehotel.com'], address: 'KG 7 Av', socials: {} } },
     null);
   assert.deepEqual(found.emails, []);
   assert.deepEqual(found.dropped_emails, ['reservations@iwawehotel.com']);
-  db.prepare("INSERT INTO research (prospect_id, collected_at, data) VALUES (?, datetime('now'), ?)")
-    .run(id, JSON.stringify({ found, sources: [], completeness: R.completeness(found) }));
+  await db.run('INSERT INTO research (prospect_id, collected_at, data) VALUES (?, now(), ?)',
+    id, JSON.stringify({ found, sources: [], completeness: R.completeness(found) }));
 
-  const brief = buildBrief(db.prepare('SELECT * FROM prospects WHERE id = ?').get(id));
+  const brief = await buildBrief(await db.get('SELECT * FROM prospects WHERE id = ?', id));
   assert.deepEqual(brief.facts, ['Hotel on Boulevard de l\'Umuganda.', '3-star hotel']);
   assert.deepEqual(brief.hours, ['Open 24 hours']);
   assert.equal(brief.address, 'KG 7 Av');
   assert.equal(brief.phone, '+250 733 304 142');
   assert.equal(brief.email, '', 'the dead-domain email from the prospect record is not used either');
 
-  assert.equal(exportProspect(id).research.data.found.address, 'KG 7 Av');
-  eraseProspect(id);
-  assert.equal(db.prepare('SELECT COUNT(*) AS n FROM research WHERE prospect_id = ?').get(id).n, 0);
+  assert.equal((await exportProspect(id)).research.data.found.address, 'KG 7 Av');
+  await eraseProspect(id);
+  assert.equal((await db.get('SELECT COUNT(*) AS n FROM research WHERE prospect_id = ?', id)).n, 0);
 });
 
 test('a lost domain now showing spam is recognised; a real site is not', () => {

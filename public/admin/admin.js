@@ -38,6 +38,29 @@
     setTimeout(() => t.remove(), err ? 6000 : 3000);
   }
 
+  const readDataUrl = (blob) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(blob); });
+
+  // Phone photos are often 5-10 MB; the server takes up to 3 MB. Big or huge images are
+  // scaled to 2000 px on the long side and saved as JPEG, which also keeps the sites fast.
+  async function photoForUpload(file) {
+    if (!/^image\/(jpeg|png|webp)$/.test(file.type)) throw new Error('type');
+    const img = await createImageBitmap(file);
+    const MAX = 2000;
+    if (file.size <= 1.5e6 && Math.max(img.width, img.height) <= MAX) { img.close(); return readDataUrl(file); }
+    const k = Math.min(1, MAX / Math.max(img.width, img.height));
+    const canvas = h('canvas', { width: Math.round(img.width * k), height: Math.round(img.height * k) });
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#fff'; // transparent PNGs get a white background instead of black
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    img.close();
+    for (const q of [0.85, 0.75, 0.6]) {
+      const blob = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', q));
+      if (blob && blob.size <= 2.5e6) return readDataUrl(blob);
+    }
+    throw new Error('too big');
+  }
+
   async function api(method, path, body) {
     let res;
     try {
@@ -160,6 +183,7 @@
           navItem('compliance', 'shield', 'Compliance')),
         h('div', { class: 'feat' }, h('span', { class: 't' }, 'Connections'),
           feature('Claude', f.ai, 'on', 'off', 'warn', f.ai ? f.ai_model : 'No ANTHROPIC_API_KEY: sites get placeholder text'),
+          feature('DeepSeek', f.deepseek, 'on', 'off', 'warn', f.deepseek ? f.deepseek_model : 'Set DEEPSEEK_API_KEY for saved company action plans'),
           feature('Google Places', f.places, 'on', 'off', 'off', 'GOOGLE_PLACES_API_KEY'),
           feature('Vercel', f.vercel, 'on', 'local', 'off', 'VERCEL_TOKEN')),
         h('div', { class: 'whoami' }, h('span', { class: 'avatar' }, String(state.me.username).slice(0, 2).toUpperCase()),
@@ -380,13 +404,14 @@
 
     const warnings = r.warnings.length ? h('div', { class: 'stack', style: 'gap:8px' }, r.warnings.map((w) =>
       h('div', { class: 'card row', style: 'padding:10px 14px' }, h('span', { class: 'badge warn' }, 'Check first'), h('span', { class: 'small' }, w)))) : null;
+    const savedPlan = r.analysis ? analysisCard(r.analysis, r.checked_at) : null;
 
     if (r.unchecked) {
-      panel.append(h('div', { class: 'card empty' }, r.unchecked));
+      panel.append(h('div', { class: 'card empty' }, r.unchecked), savedPlan);
       return;
     }
     if (!r.issues.length) {
-      panel.append(h('div', { class: 'card empty' }, 'No problems found in the last audit. Their website looks healthy, so there is nothing to offer them here.'));
+      panel.append(h('div', { class: 'card empty' }, 'No problems found in the last audit. Their website looks healthy, so there is nothing to offer them here.'), savedPlan);
       return;
     }
 
@@ -403,9 +428,40 @@
         h('dt', {}, 'What fixes it'), h('dd', {}, x.fix, SERVICE_LABEL[x.service] ? h('span', { class: 'small muted' }, ` · service: ${SERVICE_LABEL[x.service]}`) : null),
         x.evidence ? [h('dt', {}, 'Evidence'), h('dd', { class: 'small mono' }, x.evidence)] : null))));
 
-    panel.append(h('div', { class: 'cols wide-left' },
+    const analyze = h('button', { class: 'btn primary', disabled: !state.me.features.deepseek },
+      r.analysis ? 'Refresh AI action plan' : 'Analyze with DeepSeek');
+    analyze.title = state.me.features.deepseek ? 'Generate and save a plan based on the latest audit' : 'Set DEEPSEEK_API_KEY to enable analysis';
+    analyze.onclick = async () => {
+      if (await act(analyze, () => api('POST', `/api/prospects/${p.id}/analyze`, {}), 'AI action plan saved')) reload();
+    };
+    const aiAction = h('div', { class: 'row ai-action' },
+      h('div', {}, h('h2', { style: 'margin:0' }, 'AI action plan'),
+        h('span', { class: 'small muted' }, 'Recommendations use the latest audit. Verify them before acting.')),
+      analyze);
+
+    panel.append(aiAction, savedPlan, h('div', { class: 'cols wide-left' },
       h('div', { class: 'stack' }, summary, warnings, list),
       h('div', { class: 'stack' }, contactCard(p, r, d, reload))));
+  }
+
+  function analysisCard(analysis, checkedAt) {
+    const report = analysis.report;
+    const stale = !checkedAt || String(analysis.audit_checked_at) !== String(checkedAt);
+    return h('section', { class: 'card stack ai-plan' },
+      h('div', { class: 'row' }, h('h2', { style: 'margin:0' }, 'Saved action plan'), h('span', { class: 'spacer' }),
+        stale ? h('span', { class: 'badge warn' }, 'Based on an older audit') : h('span', { class: 'badge good' }, 'Current audit')),
+      h('p', { class: 'small muted' }, `Saved ${when(analysis.created_at)} · ${analysis.model}`),
+      h('h3', {}, 'Problems analyzed'),
+      h('ul', {}, analysis.findings.map((finding) => h('li', {}, h('b', {}, finding.problem),
+        finding.evidence ? ` · ${finding.evidence}` : ` · ${finding.consequence}`))),
+      h('p', {}, report.executive_summary),
+      h('ol', { class: 'ai-steps' }, report.steps.map((step) => h('li', {},
+        h('h3', {}, step.title), h('p', { class: 'small' }, step.reason),
+        h('ul', {}, step.actions.map((action) => h('li', {}, action))),
+        h('p', { class: 'small' }, h('b', {}, 'Success check: '), step.success_looks_like)))),
+      report.quick_wins.length ? [h('h3', {}, 'Quick wins'), h('ul', {}, report.quick_wins.map((item) => h('li', {}, item)))] : null,
+      report.questions.length ? [h('h3', {}, 'Questions to confirm'), h('ul', {}, report.questions.map((item) => h('li', {}, item)))] : null,
+      h('p', { class: 'small muted' }, 'AI-generated recommendations can be inaccurate. Check the business details and current website before acting.'));
   }
 
   function contactCard(p, r, d, reload) {
@@ -619,7 +675,8 @@
     const upload = h('input', { type: 'file', accept: 'image/jpeg,image/png,image/webp', multiple: true });
     upload.onchange = async () => {
       for (const file of upload.files) {
-        const data = await new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = rej; r.readAsDataURL(file); });
+        const data = await photoForUpload(file).catch(() => null);
+        if (!data) { toast(`${file.name}: could not read this image. Use a JPEG, PNG or WebP photo.`, true); continue; }
         const r = await act(null, () => api('POST', `/api/prospects/${p.id}/photos`, { name: file.name, data }));
         if (r) { d.photos.push(r.name); selected.push(r.name); }
       }

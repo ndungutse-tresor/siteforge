@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const { fetchOsm } = require('../src/prospecting/osm');
 const { parseRdbCsv } = require('../src/prospecting/rdb');
 const { importProspects } = require('../src/prospecting/importer');
+const { db } = require('../src/core/db');
 
 (async () => {
   const [source, file] = process.argv.slice(2);
@@ -19,6 +20,6 @@ const { importProspects } = require('../src/prospecting/importer');
     console.error('Usage: npm run import -- osm   |   npm run import -- csv <file.csv>');
     process.exit(1);
   }
-  const r = importProspects(records);
+  const r = await importProspects(records);
   console.log(`Found ${records.length}: ${r.added} added, ${r.merged} merged, ${r.skipped} unchanged.`);
-})().catch((e) => { console.error(e.message); process.exit(1); });
+})().catch((e) => { console.error(e.message); process.exitCode = 1; }).finally(() => db.close());

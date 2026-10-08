@@ -1,7 +1,7 @@
 'use strict';
 const dns = require('node:dns').promises;
 const { Resolver } = dns;
-const { db } = require('../core/db');
+const { db, tx } = require('../core/db');
 const { resolveWebsite } = require('../prospecting/places');
 const S = require('./signals');
 const { score } = require('./score');
@@ -247,22 +247,23 @@ async function inspect(rawUrl, { name } = {}) {
 // Audits a prospect and saves the result. Only our own derived data is stored.
 // Throws TransientAuditError when the result would be unreliable; nothing is saved then.
 async function auditProspect(prospectId) {
-  const p = db.prepare('SELECT * FROM prospects WHERE id = ?').get(prospectId);
+  const p = await db.get('SELECT * FROM prospects WHERE id = ?', prospectId);
   if (!p) throw new Error(`Prospect ${prospectId} not found`);
   const site = await resolveWebsite(p);
   const r = await inspect(site.url, { name: p.name });
   const s = score(r.signals, p.sector);
   const signals = { ...r.signals, website_source: site.source, notes: r.notes, raw: s.raw, wtp: s.wtp };
 
-  db.prepare(`INSERT INTO audits (prospect_id, http_status, final_url, has_https, is_mobile_friendly, load_ms,
-      last_copyright_year, cms_detected, has_ssl_error, is_parked, signals, score)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).run(p.id, r.http_status, r.final_url, r.has_https,
+  await tx(async () => {
+    await db.run(`INSERT INTO audits (prospect_id, http_status, final_url, has_https, is_mobile_friendly, load_ms,
+        last_copyright_year, cms_detected, has_ssl_error, is_parked, signals, score)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, p.id, r.http_status, r.final_url, r.has_https,
     r.is_mobile_friendly, r.load_ms, r.last_copyright_year, r.cms_detected, r.has_ssl_error, r.is_parked,
     JSON.stringify(signals), s.score);
-
-  db.prepare(`UPDATE prospects SET website_status = ?, score = ?, score_breakdown = ?,
-      stage = CASE WHEN stage = 'discovered' THEN 'audited' ELSE stage END, updated_at = datetime('now')
-    WHERE id = ?`).run(r.website_status, s.score, JSON.stringify(s), p.id);
+    await db.run(`UPDATE prospects SET website_status = ?, score = ?, score_breakdown = ?,
+        stage = CASE WHEN stage = 'discovered' THEN 'audited' ELSE stage END, updated_at = now()
+      WHERE id = ?`, r.website_status, s.score, JSON.stringify(s), p.id);
+  });
   return { prospect_id: p.id, website_status: r.website_status, ...s, notes: r.notes };
 }
 

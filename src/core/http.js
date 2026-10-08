@@ -44,7 +44,15 @@ async function readJson(req, limit = 100 * 1024) {
   if (!type.toLowerCase().startsWith('application/json')) {
     throw new HttpError(415, 'json_required', 'Send JSON.');
   }
-  const text = await readBody(req, limit);
+  let text;
+  if (req.readableEnded && req.body !== undefined) {
+    // Vercel's Node helpers read the body before our code runs; use what they kept.
+    const b = req.body;
+    text = Buffer.isBuffer(b) ? b.toString('utf8') : typeof b === 'string' ? b : JSON.stringify(b ?? {});
+    if (Buffer.byteLength(text) > limit) throw new HttpError(413, 'too_large', 'Request is too large.');
+  } else {
+    text = await readBody(req, limit);
+  }
   if (!text) return {};
   let body;
   try { body = JSON.parse(text); } catch (e) { throw new HttpError(400, 'bad_json', 'Invalid JSON.'); }
